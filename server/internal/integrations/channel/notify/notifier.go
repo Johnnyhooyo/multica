@@ -316,10 +316,13 @@ const replyHint = "直接回复本条消息即可处理。"
 // grows the text, and a budget measured before it is not a budget.
 //
 // It lives beside renderPush because it reads that function's layout back. The
-// tail is recognised by value — the reply hint is this package's own constant,
-// and the link is a bare https:// token on its own line. A member-authored
-// body whose last line happens to look like one costs a few runes of body and
-// nothing else.
+// tail is read off renderPush's grammar, which permits at most one bare-link
+// line followed by at most one reply hint, at the very end — never more. A
+// looser match that just kept taking trailing link-shaped lines would walk into
+// the body: a member whose comment ends in a bare URL would have that line
+// preserved whole in front of the real deep link, and at adversarial length it
+// would crowd the real link out of the budget, which is the failure this
+// function exists to prevent.
 func FitPush(text string, maxRunes int) string {
 	if maxRunes <= 0 {
 		return ""
@@ -330,12 +333,12 @@ func FitPush(text string, maxRunes int) string {
 	lines := strings.Split(text, "\n")
 	head, rest := lines[0], lines[1:]
 	var tail []string
-	for len(rest) > 0 {
-		last := rest[len(rest)-1]
-		if last != replyHint && !isBarePushLink(last) {
-			break
-		}
-		tail = append([]string{last}, tail...)
+	if len(rest) > 0 && rest[len(rest)-1] == replyHint {
+		tail = append(tail, rest[len(rest)-1])
+		rest = rest[:len(rest)-1]
+	}
+	if len(rest) > 0 && isBarePushLink(rest[len(rest)-1]) {
+		tail = append([]string{rest[len(rest)-1]}, tail...)
 		rest = rest[:len(rest)-1]
 	}
 	tailText := ""
@@ -347,6 +350,16 @@ func FitPush(text string, maxRunes int) string {
 	// One rune of ellipsis marks every cut, so the recipient can tell a
 	// truncated push from a short one.
 	const ellipsis = "…"
+
+	// A tail that cannot coexist with the title is not the tail this function
+	// was written to protect: renderPush's own link is bounded by the configured
+	// app URL. Keep the title, which is what identifies the notification, rather
+	// than spending the budget on the tail and having capRunes cut it off the
+	// end anyway.
+	if tailRunes+utf8.RuneCountInString(head) > maxRunes {
+		return capRunes(truncateRunes(head, maxRunes-1)+ellipsis, maxRunes)
+	}
+
 	if body := strings.Join(rest, "\n"); body != "" {
 		room := maxRunes - utf8.RuneCountInString(head) - tailRunes - 2 // "\n" + ellipsis
 		if room > 0 {

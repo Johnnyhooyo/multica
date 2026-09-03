@@ -68,6 +68,40 @@ func TestFitPushCapsATitleThatAloneExceedsTheBudget(t *testing.T) {
 	}
 }
 
+// A member-authored body may end in a bare URL of its own. Recognising the
+// tail by value alone walks straight past it into the body, preserving it whole
+// in front of the real deep link — and at adversarial length it crowds the real
+// link out of the budget entirely, which is the exact failure FitPush exists to
+// prevent.
+func TestFitPushDoesNotMistakeAMemberURLForTheDeepLink(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.example.com")
+	issueID := "33333333-3333-3333-3333-333333333333"
+	memberURL := "https://evil.example/" + strings.Repeat("a", 3950)
+	item := map[string]any{
+		"type":     "status_changed",
+		"title":    "Ship the thing",
+		"issue_id": &issueID,
+		"body":     strings.Repeat("蒜", 100) + "\n" + memberURL,
+	}
+	text := renderPush(item, testWorkspace, "acme", true)
+	link := pushLink(item, testWorkspace, "acme")
+
+	const max = 4000
+	got := FitPush(text, max)
+	if n := utf8.RuneCountInString(got); n > max {
+		t.Errorf("%d runes, want at most %d", n, max)
+	}
+	if !strings.Contains(got, link) {
+		t.Error("a member's trailing bare URL crowded out the real deep link")
+	}
+	if !strings.Contains(got, replyHint) {
+		t.Error("a member's trailing bare URL crowded out the reply hint")
+	}
+	if !strings.Contains(got, "Ship the thing") {
+		t.Error("dropped the title")
+	}
+}
+
 func TestFitPushRejectsANonPositiveBudget(t *testing.T) {
 	if got := FitPush("anything", 0); got != "" {
 		t.Errorf("FitPush(_, 0) = %q, want empty", got)
