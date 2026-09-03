@@ -96,8 +96,9 @@ func newTestNotifier(t *testing.T, q *fakeQueries, a *fakeAdapter) *Notifier {
 
 func inReviewEvent() events.Event {
 	// issue_id is a *string on the wire: inboxItemToResponse builds nullable
-	// columns with uuidToPtr. Keep the pointer here — a plain string fixture
-	// lets a string-only parser pass while production writes a NULL issue_id.
+	// columns with util.UUIDToPtr. Keep the pointer here — a plain string
+	// fixture lets a string-only parser pass while production writes a NULL
+	// issue_id.
 	issueID := testIssue
 	return events.Event{
 		Type:        protocol.EventInboxNew,

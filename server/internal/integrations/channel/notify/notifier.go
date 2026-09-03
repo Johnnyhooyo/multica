@@ -192,8 +192,9 @@ func (n *Notifier) channelOrder() []string {
 
 // itemString reads a string field from an inbox_item map. Nullable columns
 // reach the bus as *string, because inboxItemToResponse builds them with
-// uuidToPtr (internal/handler/inbox.go:245), so both shapes have to be
-// accepted — asserting only string silently drops every nullable field.
+// util.UUIDToPtr / util.TextToPtr (cmd/server/notification_listeners.go:1026),
+// so both shapes have to be accepted — asserting only string silently drops
+// every nullable field.
 func itemString(item map[string]any, key string) string {
 	switch v := item[key].(type) {
 	case string:
