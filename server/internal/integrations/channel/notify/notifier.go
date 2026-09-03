@@ -356,9 +356,14 @@ func FitPush(text string, maxRunes int) string {
 	// over-long title is the fallback's job below, which cuts the title and keeps
 	// the tail; measuring against the untruncated head here would throw away a
 	// link that had room, which is the failure this function exists to prevent.
-	// When even that minimum does not fit, the title wins: it is what identifies
-	// the notification, and spending the budget on the tail would leave capRunes
-	// to cut it off the end anyway.
+	//
+	// The +2 is exactly what the fallback needs: it cuts the head to
+	// maxRunes-tailRunes-1, so one rune of title survives iff tailRunes+2 fits.
+	// One rune is not much of a title — renderPush's head opens with "**[", so
+	// the first survivor is punctuation — but a budget that tight is smaller than
+	// the deep link plus two, which no configured app URL comes near. Below it
+	// there is no push worth shaping, and the title is the half that at least
+	// says a notification happened.
 	if tailRunes+2 > maxRunes {
 		return capRunes(truncateRunes(head, maxRunes-1)+ellipsis, maxRunes)
 	}
@@ -374,10 +379,13 @@ func FitPush(text string, maxRunes int) string {
 }
 
 // capRunes is the unconditional guarantee FitPush's callers need: whatever the
-// reasoning above produced, what comes back fits. It only fires on input no
-// real deployment produces — a deep link long enough to blow the budget on its
-// own needs an app URL of a few thousand characters — but the alternative is
-// handing a platform a frame it refuses whole while acking the send.
+// reasoning above produced, what comes back fits.
+//
+// No branch above currently needs it — each one lands at or under the budget on
+// its own arithmetic. It stays because that arithmetic is subtle enough to have
+// been wrong three times in review, and the failure it backstops is silent: a
+// platform that refuses an over-long frame whole while acking the send loses the
+// push with no error anywhere to notice it by.
 func capRunes(s string, maxRunes int) string {
 	if utf8.RuneCountInString(s) <= maxRunes {
 		return s
