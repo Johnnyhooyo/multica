@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -68,11 +69,12 @@ func (f *fakeQueries) CreateChannelPushMessage(_ context.Context, arg db.CreateC
 }
 
 type fakeAdapter struct {
-	result DeliverResult
-	err    error
-	calls  int
-	lastTo db.ChannelUserBinding
-	lastTx string
+	result    DeliverResult
+	err       error
+	noReplies bool
+	calls     int
+	lastTo    db.ChannelUserBinding
+	lastTx    string
 }
 
 func (a *fakeAdapter) DeliverDM(_ context.Context, _ PushRef, binding db.ChannelUserBinding, text string) (DeliverResult, error) {
@@ -81,6 +83,8 @@ func (a *fakeAdapter) DeliverDM(_ context.Context, _ PushRef, binding db.Channel
 	a.lastTx = text
 	return a.result, a.err
 }
+
+func (a *fakeAdapter) AcceptsReplies() bool { return !a.noReplies }
 
 func newTestNotifier(t *testing.T, q *fakeQueries, a *fakeAdapter) *Notifier {
 	t.Helper()
@@ -143,6 +147,38 @@ func TestNotifierDeliversAndRecordsAnInReviewPush(t *testing.T) {
 	}
 	if util.UUIDToString(got.RecipientUserID) != testRecipient {
 		t.Errorf("ledger RecipientUserID = %q, want %q", util.UUIDToString(got.RecipientUserID), testRecipient)
+	}
+}
+
+// A platform that cannot carry a reply back must not be handed a message
+// promising one. WeCom is this case: the hint would tell every WeCom user to
+// reply to a push whose reply is discarded, and the deep link is their only
+// route. The ledger row goes with it — an id nothing can ever match.
+func TestNotifierDoesNotPromiseRepliesAPlatformCannotCarry(t *testing.T) {
+	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_nr"}, noReplies: true}
+	newTestNotifier(t, q, a).HandleInboxNew(inReviewEvent())
+
+	if a.calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1: the push still goes out", a.calls)
+	}
+	if strings.Contains(a.lastTx, replyHint) {
+		t.Errorf("pushed the reply hint to a platform that cannot accept replies: %q", a.lastTx)
+	}
+	if len(q.created) != 0 {
+		t.Errorf("ledger rows = %d, want 0", len(q.created))
+	}
+}
+
+// The mirror of the case above: where a reply can come back, the recipient has
+// to be told, or the whole in-IM decision path is invisible.
+func TestNotifierPromisesRepliesWhereTheyWork(t *testing.T) {
+	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_r"}}
+	newTestNotifier(t, q, a).HandleInboxNew(inReviewEvent())
+
+	if !strings.Contains(a.lastTx, replyHint) {
+		t.Errorf("replyable push carries no reply hint: %q", a.lastTx)
 	}
 }
 

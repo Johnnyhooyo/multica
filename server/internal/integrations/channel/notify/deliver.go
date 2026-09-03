@@ -69,4 +69,18 @@ type PushRef struct {
 // address a single chat; the shared layer never guesses single-vs-group.
 type DMDeliverer interface {
 	DeliverDM(ctx context.Context, ref PushRef, binding db.ChannelUserBinding, text string) (DeliverResult, error)
+
+	// AcceptsReplies reports whether a reply to a push on this platform can
+	// ever reach us. It answers for the platform, not for one push: a
+	// platform that can be replied to still produces individual pushes that
+	// cannot be (an empty MessageID, a relayed hand-off), and the ledger row
+	// is what gates those.
+	//
+	// The rendered text promises the recipient they can reply, so it needs
+	// this answer before delivery rather than after. WeCom returns false —
+	// it can push, but its send ack carries no message id and its inbound
+	// callback carries no reply context, so a reply lands in an ordinary
+	// conversation and is discarded. Promising one there would tell every
+	// WeCom user to do something that silently does nothing.
+	AcceptsReplies() bool
 }

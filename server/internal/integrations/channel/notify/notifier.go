@@ -120,7 +120,11 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	if ws, wsErr := n.q.GetWorkspace(ctx, workspaceID); wsErr == nil {
 		slug = ws.Slug
 	}
-	text := renderPush(item, util.UUIDToString(workspaceID), slug, decision.Replyable)
+	// A push is only offered as replyable when the notification type allows a
+	// reply AND the platform can carry one back. WeCom fails the second half,
+	// so its pushes render without the reply hint and rely on the deep link.
+	replyable := decision.Replyable && adapter.AcceptsReplies()
+	text := renderPush(item, util.UUIDToString(workspaceID), slug, replyable)
 	if text == "" {
 		return
 	}
@@ -140,7 +144,7 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	// Only a delivered push with a real platform message id can be replied
 	// to. StateHandedOff has no id by construction (the relay is one-way),
 	// and some platforms deliver without returning one at all.
-	if !decision.Replyable || res.State != StateDelivered || res.MessageID == "" {
+	if !replyable || res.State != StateDelivered || res.MessageID == "" {
 		return
 	}
 	issueID, _ := parseItemUUID(item, "issue_id")

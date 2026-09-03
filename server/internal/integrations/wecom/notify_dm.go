@@ -14,6 +14,8 @@ import (
 // than reported. 4000 leaves headroom.
 const inboxMarkdownMaxLen = 4000
 
+var _ notify.DMDeliverer = (*Outbound)(nil)
+
 // DeliverDM sends an inbox push to a bound member over the aibot socket.
 //
 // This is the body that used to live in tryDeliverInbox. The subscription,
@@ -76,6 +78,12 @@ func (o *Outbound) DeliverDM(ctx context.Context, ref notify.PushRef, binding db
 		"installation_id", uuidStringPub(binding.InstallationID))
 	return notify.DeliverResult{State: notify.StateDelivered}, nil
 }
+
+// AcceptsReplies is false for WeCom, for the same reason DeliverDM reports no
+// MessageID: neither end of the loop exists. Closing it needs the aibot
+// send ack to carry a msgid (sendTextCtx discards the ack body today) and an
+// inbound quoted-reply field; both are unknown and out of scope.
+func (o *Outbound) AcceptsReplies() bool { return false }
 
 // truncateRunes trims s to at most maxRunes runes. Rune-based rather than
 // byte-based so the cut never splits a Chinese character.
