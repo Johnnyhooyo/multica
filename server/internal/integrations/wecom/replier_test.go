@@ -352,8 +352,8 @@ func TestSendBindingPrompt_ThrottledSendsNoURL(t *testing.T) {
 
 // TestPost_HonoursTheCallersDeadline guards the budget the calling code
 // already believed it had. Bus delivery is synchronous, so the reply path runs
-// on the publishing goroutine; outbound.go and handleInboxNew each build a
-// bounded ctx precisely so a stalled WeCom round trip cannot hold it. Waiting
+// on the publishing goroutine; outbound.go and DeliverDM (notify_dm.go) each
+// build a bounded ctx precisely so a stalled WeCom round trip cannot hold it. Waiting
 // for the server's verdict on a hardcoded context.Background() made those
 // bounds decorative — a lost ack cost the full ackTimeout per subscriber, in
 // series, on an HTTP handler's goroutine.

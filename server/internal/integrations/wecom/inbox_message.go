@@ -4,6 +4,19 @@ package wecom
 // Uses markdown so it renders cleanly through aibot_send_msg (which does not
 // accept msgtype=text). Kept in a separate file so the outbound handler stays
 // focused on delivery and this module owns the wording + link building.
+//
+// UNREFERENCED FROM THE LIVE PUSH PATH as of the notify-package move
+// (notify_dm.go / notifier.go): the subscription and rendering now belong to
+// notify.renderPush, and WeCom's DeliverDM only sends whatever text it is
+// handed. renderPush is not yet built from this file's buildInboxMarkdown —
+// it is a separate, simpler implementation missing this one's member-link
+// escaping (markdown.go's breakMemberLinks) and its length-budget truncation.
+// Moving buildInboxMarkdown up would also require moving breakMemberLinks
+// somewhere both packages can reach without a wecom<->notify import cycle
+// (replier.go, unrelated to inbox pushes, depends on it too), which is a
+// bigger, security-sensitive refactor than this task's scope. Left as a
+// follow-up rather than done partially or silently. Exercised only by
+// inbox_message_test.go until that follow-up lands or this file is deleted.
 
 import (
 	"net/url"
