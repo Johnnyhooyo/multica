@@ -33,6 +33,13 @@ const (
 	OutcomeIssueUsage    Outcome = "issue_usage"
 	OutcomeAgentOffline  Outcome = "agent_offline"
 	OutcomeAgentArchived Outcome = "agent_archived"
+	// OutcomePushReply — the message replied to an inbox push and was
+	// injected as an issue comment. It never touched a chat session.
+	OutcomePushReply Outcome = "push_reply"
+	// OutcomePushReplyDenied — the message replied to a known push but the
+	// sender was not the person it was addressed to, or the push had no
+	// issue to reply into. Nothing was written; the sender is told why.
+	OutcomePushReplyDenied Outcome = "push_reply_denied"
 )
 
 // DropReason enumerates the drop-audit categories. Values match the legacy
@@ -73,6 +80,11 @@ type Result struct {
 	// message also carried downloadable media. Repliers use it to tell the
 	// sender to include that media again with the corrected command.
 	IssueUsageHadMedia bool
+	// PushReplyText is the message to echo back for the two push-reply
+	// outcomes. Carried on Result rather than derived from the Outcome
+	// because the reason for a denial is decided server-side, and every
+	// replier must render the same words.
+	PushReplyText string
 	// runScheduled reports whether this ingest scheduled a normal chat run.
 	// It is Router-internal state: repliers must continue to use Outcome.
 	runScheduled bool
@@ -185,6 +197,19 @@ type ChannelChatLifecycle interface {
 	ChannelChatStarted(event ChannelChatStartedEvent)
 	ChannelChatTitleInitialized(workspaceID, creatorID, sessionID pgtype.UUID, title string)
 	GenerateChannelChatTitle(workspaceID, creatorID, sessionID pgtype.UUID, currentTitle, sourceText string)
+}
+
+// PushReplyPoster resolves a reply-to-an-inbox-push and injects it as an
+// issue comment.
+//
+// Deliberately a sibling of ChannelChatLifecycle, not a fourth method on it:
+// that interface's three methods are all chat-session lifecycle, and an issue
+// comment is not part of a chat session's life. *Handler implements both.
+type PushReplyPoster interface {
+	// LookupPush finds the ledger row for a platform message id. A miss is
+	// (_, false, nil), not an error: most replies are ordinary chat.
+	LookupPush(ctx context.Context, installationID pgtype.UUID, channelMessageID string) (db.ChannelPushMessage, bool, error)
+	PostPushReplyComment(ctx context.Context, push db.ChannelPushMessage, senderUserID pgtype.UUID, content string) (PushReplyResult, error)
 }
 
 // ChannelChatStartedEvent contains enough committed metadata for clients to

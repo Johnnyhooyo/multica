@@ -36,10 +36,11 @@ type Router struct {
 	mu   sync.RWMutex
 	sets map[channel.Type]ResolverSet
 
-	issues    IssueCreator
-	tasks     TaskEnqueuer
-	reader    SessionReader
-	lifecycle ChannelChatLifecycle
+	issues      IssueCreator
+	tasks       TaskEnqueuer
+	reader      SessionReader
+	lifecycle   ChannelChatLifecycle
+	pushReplies PushReplyPoster
 
 	batcher *pendingBatcher
 
@@ -77,6 +78,9 @@ type RouterConfig struct {
 	MediaConcurrency int
 	Logger           *slog.Logger
 	Lifecycle        ChannelChatLifecycle
+	// PushReplies handles replies to inbox pushes. Nil disables the path
+	// entirely: every message takes the ordinary chat route.
+	PushReplies PushReplyPoster
 }
 
 // NewRouter builds a Router around the shared (platform-agnostic) services:
@@ -103,6 +107,7 @@ func NewRouter(issues IssueCreator, tasks TaskEnqueuer, reader SessionReader, cf
 		tasks:        tasks,
 		reader:       reader,
 		lifecycle:    cfg.Lifecycle,
+		pushReplies:  cfg.PushReplies,
 		replyTimeout: cfg.ReplyTimeout,
 		mediaTimeout: cfg.MediaTimeout,
 		mediaCtx:     mediaCtx,
@@ -355,6 +360,19 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 			return r.drop(ctx, set, msg, inst.ID, DropReasonNonWorkspaceMember), finalizeMark, nil
 		default:
 			return Result{}, finalizeRelease, fmt.Errorf("resolve sender: %w", err)
+		}
+	}
+
+	// 4b. Inbox-push reply. A reply whose target is a push we sent is a
+	// decision on that push's issue, not chat. It short-circuits here —
+	// before session resolution — because its meaning is already fixed by
+	// the message it answers: it must not open or extend a chat_session,
+	// and ParseIssueCommand must never see it.
+	if r.pushReplies != nil && msg.ReplyTo != nil {
+		if res, handled, err := r.handlePushReply(ctx, inst, msg, identity); err != nil {
+			return Result{}, finalizeRelease, err
+		} else if handled {
+			return res, finalizeMark, nil
 		}
 	}
 
@@ -1046,6 +1064,46 @@ func (r *Router) applyFinalize(ctx context.Context, set ResolverSet, instID pgty
 func (r *Router) drop(ctx context.Context, set ResolverSet, msg channel.InboundMessage, instID pgtype.UUID, reason DropReason) Result {
 	_ = set.Audit.RecordDrop(ctx, instID, msg, reason)
 	return Result{Outcome: OutcomeDropped, DropReason: reason, InstallationID: instID}
+}
+
+// handlePushReply reports handled=false when the reply targets something that
+// is not one of our pushes, which is the common case.
+func (r *Router) handlePushReply(ctx context.Context, inst ResolvedInstallation, msg channel.InboundMessage, identity ResolvedIdentity) (Result, bool, error) {
+	push, ok, err := r.pushReplies.LookupPush(ctx, inst.ID, msg.ReplyTo.MessageID)
+	if err != nil {
+		return Result{}, false, fmt.Errorf("lookup push: %w", err)
+	}
+	if !ok && msg.ReplyTo.RootID != "" && msg.ReplyTo.RootID != msg.ReplyTo.MessageID {
+		// Slack reports only a thread-level ts on inbound, and a DM push
+		// starts its own thread, so the root is the push itself.
+		push, ok, err = r.pushReplies.LookupPush(ctx, inst.ID, msg.ReplyTo.RootID)
+		if err != nil {
+			return Result{}, false, fmt.Errorf("lookup push root: %w", err)
+		}
+	}
+	if !ok {
+		return Result{}, false, nil
+	}
+
+	// msg.Text, not msg.CommandText: a push reply is prose the sender wrote,
+	// never a command to classify, and Handle's /new /clear rewriting only
+	// guarantees CommandText is command-free, not that it still holds every
+	// word the sender typed.
+	reply, err := r.pushReplies.PostPushReplyComment(ctx, push, identity.UserID, msg.Text)
+	if err != nil {
+		return Result{}, false, fmt.Errorf("post push reply: %w", err)
+	}
+	outcome := OutcomePushReplyDenied
+	if reply.Posted {
+		outcome = OutcomePushReply
+	}
+	return Result{
+		Outcome:        outcome,
+		InstallationID: inst.ID,
+		Sender:         msg.Source.SenderID,
+		IssueID:        push.IssueID,
+		PushReplyText:  reply.Message,
+	}, true, nil
 }
 
 func (r *Router) createIssue(ctx context.Context, inst ResolvedInstallation, originType string, creatorUserID, sessionID pgtype.UUID, cmd IssueCommand, issuePrefix string, assignedRunFireAt time.Time) (service.IssueCreateResult, error) {

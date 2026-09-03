@@ -273,6 +273,29 @@ func TestLarkOutcomeReplierCommandOutcomesSendGuidance(t *testing.T) {
 	}
 }
 
+// TestLarkOutcomeReplierPushReplyRendersPushReplyText covers both push-reply
+// outcomes: they render identically (a notice card with res.PushReplyText),
+// but the metric distinguishes a working reply from a denial.
+func TestLarkOutcomeReplierPushReplyRendersPushReplyText(t *testing.T) {
+	for _, outcome := range []Outcome{OutcomePushReply, OutcomePushReplyDenied} {
+		t.Run(string(outcome), func(t *testing.T) {
+			log := slog.New(slog.NewTextHandler(io.Discard, nil))
+			stub := &stubAPIClientWithRecorder{configured: true}
+			rep := NewLarkOutcomeReplier(OutcomeReplierConfig{
+				APIClient: stub, BindingSvc: &BindingTokenService{}, Credentials: stubCredentialsResolver{secret: "s"},
+				Queries: stubReplierQueries{}, AppURL: "https://multica.test", Logger: log,
+			})
+			rep.Reply(context.Background(), Installation{}, InboundMessage{ChatID: "oc_chat"}, DispatchResult{Outcome: outcome, PushReplyText: "已记录"})
+			if len(stub.interactiveOut) != 1 {
+				t.Fatalf("expected one ack card, got %d", len(stub.interactiveOut))
+			}
+			if !contains(stub.interactiveOut[0].CardJSON, "已记录") {
+				t.Fatalf("ack card %q does not contain %q", stub.interactiveOut[0].CardJSON, "已记录")
+			}
+		})
+	}
+}
+
 // TestLarkOutcomeReplierIngestedAndDroppedAreSilent asserts that the
 // replier does NOT call the APIClient on outcomes owned elsewhere
 // (Patcher handles Ingested; Dropped is informational only).

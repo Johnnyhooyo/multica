@@ -184,6 +184,25 @@ func TestReply_CommandOutcomes_PostGuidance(t *testing.T) {
 // token-bearing frame goes only to the sender at chat_type=1, the group gets a
 // token-less acknowledgement, and NO group-addressed frame carries the raw
 // token. Re-pointing sendBindingPrompt at post() (the pre-fix bug) fails this.
+// TestReply_PushReply_PostsPushReplyText covers a hypothetical future WeCom
+// ReplyTo support: engine.Router only reaches these outcomes when
+// InboundMessage.ReplyTo is set, which the WeCom adapter never populates
+// today, but the switch must still render res.PushReplyText verbatim.
+func TestReply_PushReply_PostsPushReplyText(t *testing.T) {
+	for _, outcome := range []engine.Outcome{engine.OutcomePushReply, engine.OutcomePushReplyDenied} {
+		t.Run(string(outcome), func(t *testing.T) {
+			r, inst, conn := newReplierWithConn(t)
+			msg := channel.InboundMessage{Source: channel.Source{ChatID: "USER_A", ChatType: channel.ChatTypeP2P, SenderID: "USER_A"}}
+			r.Reply(context.Background(), inst, msg, engine.Result{Outcome: outcome, PushReplyText: "已记录"})
+			body := conn.sendBody(t, 0)
+			markdown, _ := body["markdown"].(map[string]any)
+			if got, _ := markdown["content"].(string); got != "已记录" {
+				t.Fatalf("reply text = %q, want %q", got, "已记录")
+			}
+		})
+	}
+}
+
 func TestSendBindingPrompt_GroupNeverLeaksToken(t *testing.T) {
 	t.Parallel()
 	const rawToken = "SECRET_BEARER_TOKEN_do_not_leak"
