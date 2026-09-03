@@ -2,7 +2,6 @@ package wecom
 
 import (
 	"context"
-	"unicode/utf8"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/notify"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -47,10 +46,11 @@ func (o *Outbound) DeliverDM(ctx context.Context, ref notify.PushRef, binding db
 	// Whole-text rather than per-field: renderPush emits no markdown link of
 	// its own — the deep link is a bare URL — so there is no "](" or "]:" in
 	// the scaffolding for the guard to separate.
-	text = breakMemberLinks(text)
-	if utf8.RuneCountInString(text) > inboxMarkdownMaxLen {
-		text = truncateRunes(text, inboxMarkdownMaxLen)
-	}
+	//
+	// FitPush rather than a plain tail cut: WeCom's pushes are never
+	// replyable, so the deep link is the recipient's only route to the
+	// notification, and a tail cut is exactly what takes it away.
+	text = notify.FitPush(breakMemberLinks(text), inboxMarkdownMaxLen)
 	var sender *wsSender
 	if o.senders != nil {
 		sender = o.senders.get(binding.InstallationID)
@@ -84,26 +84,3 @@ func (o *Outbound) DeliverDM(ctx context.Context, ref notify.PushRef, binding db
 // send ack to carry a msgid (sendTextCtx discards the ack body today) and an
 // inbound quoted-reply field; both are unknown and out of scope.
 func (o *Outbound) AcceptsReplies() bool { return false }
-
-// truncateRunes trims s to at most maxRunes runes. Rune-based rather than
-// byte-based so the cut never splits a Chinese character.
-//
-// It only ever drops a suffix, which is what lets it run after
-// breakMemberLinks without undoing it: dropping characters cannot put a "]"
-// back beside a "(" or a ":".
-func truncateRunes(s string, maxRunes int) string {
-	if maxRunes <= 0 {
-		return ""
-	}
-	if utf8.RuneCountInString(s) <= maxRunes {
-		return s
-	}
-	i := 0
-	for pos := range s {
-		if i == maxRunes {
-			return s[:pos]
-		}
-		i++
-	}
-	return s
-}

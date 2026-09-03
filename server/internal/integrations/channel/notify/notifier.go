@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -301,7 +302,103 @@ func pushTypeLabel(t string) string {
 // act on it without leaving IM.
 const replyHint = "直接回复本条消息即可处理。"
 
-// renderPush builds the pushed message text.
+// FitPush trims a rendered push to at most maxRunes runes without dropping the
+// parts the recipient acts on. It is the counterpart to renderPush: the body is
+// the only unbounded segment, so the body is what gets cut.
+//
+// A plain tail cut would take the deep link and the reply hint instead, which
+// is worst exactly where it hurts most — a platform whose pushes are not
+// replyable has the deep link as the recipient's only route to the
+// notification, so a long body would leave them a message they can neither
+// reply to nor click through.
+//
+// Adapters call this after any per-platform escaping, never before: escaping
+// grows the text, and a budget measured before it is not a budget.
+//
+// It lives beside renderPush because it reads that function's layout back. The
+// tail is recognised by value — the reply hint is this package's own constant,
+// and the link is a bare https:// token on its own line. A member-authored
+// body whose last line happens to look like one costs a few runes of body and
+// nothing else.
+func FitPush(text string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(text) <= maxRunes {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	head, rest := lines[0], lines[1:]
+	var tail []string
+	for len(rest) > 0 {
+		last := rest[len(rest)-1]
+		if last != replyHint && !isBarePushLink(last) {
+			break
+		}
+		tail = append([]string{last}, tail...)
+		rest = rest[:len(rest)-1]
+	}
+	tailText := ""
+	for _, l := range tail {
+		tailText += "\n" + l
+	}
+	tailRunes := utf8.RuneCountInString(tailText)
+
+	// One rune of ellipsis marks every cut, so the recipient can tell a
+	// truncated push from a short one.
+	const ellipsis = "…"
+	if body := strings.Join(rest, "\n"); body != "" {
+		room := maxRunes - utf8.RuneCountInString(head) - tailRunes - 2 // "\n" + ellipsis
+		if room > 0 {
+			return capRunes(head+"\n"+truncateRunes(body, room)+ellipsis+tailText, maxRunes)
+		}
+	}
+	// No room for any body means the title alone is over budget.
+	return capRunes(truncateRunes(head, maxRunes-tailRunes-1)+ellipsis+tailText, maxRunes)
+}
+
+// capRunes is the unconditional guarantee FitPush's callers need: whatever the
+// reasoning above produced, what comes back fits. It only fires on input no
+// real deployment produces — a deep link long enough to blow the budget on its
+// own needs an app URL of a few thousand characters — but the alternative is
+// handing a platform a frame it refuses whole while acking the send.
+func capRunes(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	return truncateRunes(s, maxRunes)
+}
+
+func isBarePushLink(line string) bool {
+	return strings.HasPrefix(line, "https://") && !strings.ContainsAny(line, " \t")
+}
+
+// truncateRunes trims s to at most maxRunes runes. Rune-based rather than
+// byte-based so a cut never splits a Chinese character.
+//
+// It only ever drops a suffix. That is what lets an adapter run it after a
+// markdown-escaping pass without undoing it: dropping characters cannot put a
+// "]" back beside a "(" or a ":".
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	i := 0
+	for pos := range s {
+		if i == maxRunes {
+			return s[:pos]
+		}
+		i++
+	}
+	return s
+}
+
+// renderPush builds the pushed message from an inbox_item payload. It is
+// platform-neutral: per-platform escaping and length budgets belong to the
+// adapter, which applies them to this output (see FitPush).
 //
 // Format:
 //

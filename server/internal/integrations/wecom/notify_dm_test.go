@@ -110,17 +110,23 @@ func TestDeliverDMBreaksMemberAuthoredLinks(t *testing.T) {
 // WeCom refuses an over-long markdown body, so the cap has to be enforced on
 // this side of the shared renderer, which has no per-platform length budget.
 //
-// The link case covers the seam between the two adjustments: truncation runs
-// after breakMemberLinks and must not undo it. It only drops a suffix, so it
+// The link case covers the seam between the two adjustments: the cap runs
+// after breakMemberLinks and must not undo it. It only drops characters, so it
 // cannot put a "]" back beside a "(" — this pins that.
+//
+// Both cases also pin the deep link surviving. A WeCom push is never
+// replyable, so the link is the recipient's only route to the notification,
+// and a plain tail cut over the assembled message is exactly what removes it.
 func TestDeliverDMTruncatesToTheMarkdownLimit(t *testing.T) {
+	const link = "https://app.example.com/acme/issues/abc"
 	tests := []struct {
 		name string
 		text string
 	}{
-		{"a long body", strings.Repeat("蒜", inboxMarkdownMaxLen+500)},
-		{"a long body carrying link syntax",
-			strings.Repeat("[点这里](http://evil.example)", inboxMarkdownMaxLen)},
+		{"a long body", "**[状态变更] Ship it**\n" +
+			strings.Repeat("蒜", inboxMarkdownMaxLen+500) + "\n" + link},
+		{"a long body carrying link syntax", "**[状态变更] Ship it**\n" +
+			strings.Repeat("[点这里](http://evil.example)", inboxMarkdownMaxLen) + "\n" + link},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -137,28 +143,14 @@ func TestDeliverDMTruncatesToTheMarkdownLimit(t *testing.T) {
 				t.Errorf("sent %d runes, want at most %d", got, inboxMarkdownMaxLen)
 			}
 			if strings.Contains(sent, "](") {
-				t.Error("truncation put a close bracket back next to an open paren")
+				t.Error("the cap put a close bracket back next to an open paren")
+			}
+			if !strings.Contains(sent, link) {
+				t.Error("the cap dropped the deep link, the only route a WeCom recipient has")
+			}
+			if !strings.Contains(sent, "Ship it") {
+				t.Error("the cap dropped the title")
 			}
 		})
-	}
-}
-
-func TestTruncateRunes(t *testing.T) {
-	cases := []struct {
-		in     string
-		max    int
-		expect string
-	}{
-		{"abc", 0, ""},
-		{"abc", 3, "abc"},
-		{"abc", 2, "ab"},
-		{"你好世界", 2, "你好"},
-		{"你好世界", 4, "你好世界"},
-		{"你好世界", 5, "你好世界"},
-	}
-	for _, tc := range cases {
-		if got := truncateRunes(tc.in, tc.max); got != tc.expect {
-			t.Errorf("truncateRunes(%q,%d)=%q; want %q", tc.in, tc.max, got, tc.expect)
-		}
 	}
 }
