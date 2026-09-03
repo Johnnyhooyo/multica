@@ -424,6 +424,17 @@ type TaskEnqueuer interface {
 	PromoteDeferredChannelIssueTask(ctx context.Context, taskID pgtype.UUID) error
 }
 
+// PushReplyResult is the verdict on a reply to an inbox push, produced by the
+// server side and echoed back to the sender in IM.
+//
+// A denial is a result, not an error: the sender is a real person who typed
+// something and is owed an answer. The error return is reserved for faults the
+// user cannot act on.
+type PushReplyResult struct {
+	Posted  bool
+	Message string
+}
+
 // SessionReader reads the rows the debounced flush + /issue identifier need.
 // Shared across platforms; backed by *db.Queries (the channel-backed store).
 type SessionReader interface {
