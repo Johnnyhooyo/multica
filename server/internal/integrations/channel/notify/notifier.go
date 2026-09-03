@@ -351,12 +351,15 @@ func FitPush(text string, maxRunes int) string {
 	// truncated push from a short one.
 	const ellipsis = "…"
 
-	// A tail that cannot coexist with the title is not the tail this function
-	// was written to protect: renderPush's own link is bounded by the configured
-	// app URL. Keep the title, which is what identifies the notification, rather
-	// than spending the budget on the tail and having capRunes cut it off the
-	// end anyway.
-	if tailRunes+utf8.RuneCountInString(head) > maxRunes {
+	// The question is whether the tail fits at all — alongside one rune of title
+	// and the cut marker — not whether it fits beside the whole title. An
+	// over-long title is the fallback's job below, which cuts the title and keeps
+	// the tail; measuring against the untruncated head here would throw away a
+	// link that had room, which is the failure this function exists to prevent.
+	// When even that minimum does not fit, the title wins: it is what identifies
+	// the notification, and spending the budget on the tail would leave capRunes
+	// to cut it off the end anyway.
+	if tailRunes+2 > maxRunes {
 		return capRunes(truncateRunes(head, maxRunes-1)+ellipsis, maxRunes)
 	}
 

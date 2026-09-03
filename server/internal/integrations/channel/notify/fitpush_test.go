@@ -56,15 +56,90 @@ func TestFitPushLeavesAShortPushAlone(t *testing.T) {
 }
 
 // The degenerate case: a title alone over budget. There is no body to spend, so
-// the title is what gets cut, and the guarantee still has to hold.
+// the title is what gets cut — and cutting it is not licence to drop the deep
+// link, which still fits and is still the recipient's only route to the
+// notification.
 func TestFitPushCapsATitleThatAloneExceedsTheBudget(t *testing.T) {
-	text := "**[状态变更] " + strings.Repeat("蒜", 500) + "**\nhttps://app.example.com/a/issues/x"
+	const link = "https://app.example.com/a/issues/x"
+	text := "**[状态变更] " + strings.Repeat("蒜", 500) + "**\n" + link
 	got := FitPush(text, 100)
 	if n := utf8.RuneCountInString(got); n > 100 {
 		t.Errorf("%d runes, want at most 100", n)
 	}
 	if got == "" {
-		t.Error("FitPush returned nothing for an over-long title")
+		t.Fatal("FitPush returned nothing for an over-long title")
+	}
+	if !strings.Contains(got, link) {
+		t.Errorf("a long title crowded out the deep link that still fits: %q", got)
+	}
+	if !strings.Contains(got, "蒜") {
+		t.Errorf("kept the tail but dropped the title entirely: %q", got)
+	}
+}
+
+// The tail is only worth protecting while it can share the budget with
+// something. A budget too small for even one rune of title plus the ellipsis
+// leaves nothing to identify the notification by, so the title is what wins.
+func TestFitPushDropsATailThatCannotFitAtAll(t *testing.T) {
+	text := "**[状态变更] Ship it**\nbody\nhttps://app.example.com/acme/issues/abc\n" + replyHint
+	got := FitPush(text, 8)
+	if n := utf8.RuneCountInString(got); n > 8 {
+		t.Errorf("%d runes, want at most 8", n)
+	}
+	if strings.Contains(got, "https://") {
+		t.Errorf("spent a budget too small for the title on the link: %q", got)
+	}
+	if !strings.Contains(got, "状态变更") {
+		t.Errorf("dropped what identifies the notification: %q", got)
+	}
+}
+
+// A body line may be byte-identical to the reply hint, or a bare https:// URL of
+// its own. The tail is renderPush's grammar — at most one link line then at most
+// one hint, at the very end — not whatever the body happens to look like.
+func TestFitPushIsNotFooledByBodyLinesThatLookLikeTheTail(t *testing.T) {
+	const link = "https://app.example.com/acme/issues/abc"
+	text := "**[状态变更] Ship it**\n" +
+		replyHint + "\nhttps://app.example.com/acme/issues/decoy\n" +
+		strings.Repeat("蒜", 200) + "\n" + link + "\n" + replyHint
+	const max = 120
+	got := FitPush(text, max)
+	if n := utf8.RuneCountInString(got); n > max {
+		t.Errorf("%d runes, want at most %d", n, max)
+	}
+	if !strings.Contains(got, link) {
+		t.Errorf("a decoy line displaced the real deep link: %q", got)
+	}
+	if !strings.HasSuffix(got, replyHint) {
+		t.Errorf("the reply hint is not last: %q", got)
+	}
+}
+
+// A body of nothing but blank lines is still a body by strings.Join's reckoning.
+// It must not consume the budget the tail needs.
+func TestFitPushHandlesABlankBody(t *testing.T) {
+	const link = "https://app.example.com/acme/issues/abc"
+	text := "**[状态变更] " + strings.Repeat("蒜", 200) + "**\n\n\n\n" + link
+	const max = 100
+	got := FitPush(text, max)
+	if n := utf8.RuneCountInString(got); n > max {
+		t.Errorf("%d runes, want at most %d", n, max)
+	}
+	if !strings.Contains(got, link) {
+		t.Errorf("blank body lines crowded out the deep link: %q", got)
+	}
+}
+
+// Budgets of one and two runes have no room for a cut marker plus content. They
+// are not reachable from any real platform, but the ≤ maxRunes guarantee is
+// unconditional, so they may not panic or overflow either.
+func TestFitPushSurvivesATinyBudget(t *testing.T) {
+	text := "**[状态变更] Ship it**\nbody\nhttps://app.example.com/acme/issues/abc\n" + replyHint
+	for _, max := range []int{1, 2, 3} {
+		got := FitPush(text, max)
+		if n := utf8.RuneCountInString(got); n > max {
+			t.Errorf("FitPush(_, %d) = %d runes, want at most %d", max, n, max)
+		}
 	}
 }
 
