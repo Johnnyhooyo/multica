@@ -27,15 +27,8 @@ const deliverTimeout = 5 * time.Second
 
 // Queries is what the notifier needs from the database. *db.Queries
 // satisfies it.
-//
-// GetIssueStatusEntryByKey is the one method issuestatus.Effective calls, so
-// it is declared here directly rather than by embedding issuestatus.Querier
-// (which also requires ListIssueStatusEntries, SeedIssueStatusEntries and
-// ListIssueStatusKeysByCategories — CRUD this package never does). Pulling in
-// the full surface would force every caller of New, including tests, to
-// implement three methods this package never calls.
 type Queries interface {
-	GetIssueStatusEntryByKey(ctx context.Context, arg db.GetIssueStatusEntryByKeyParams) (db.IssueStatus, error)
+	issuestatus.EntryReader
 	FindChannelBindingForMember(ctx context.Context, arg db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error)
 	GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error)
 	CreateChannelPushMessage(ctx context.Context, arg db.CreateChannelPushMessageParams) (db.ChannelPushMessage, error)
@@ -107,7 +100,7 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	rawStatus, _ := item["issue_status"].(string)
 	effective := rawStatus
 	if rawStatus != "" {
-		effective = effectiveStatus(ctx, n.q, workspaceID, rawStatus)
+		effective = issuestatus.Effective(ctx, n.q, workspaceID, rawStatus)
 	}
 	decision := Decide(notifType, effective)
 	if !decision.Push {
@@ -195,30 +188,6 @@ func (n *Notifier) channelOrder() []string {
 	}
 	sort.Strings(order)
 	return order
-}
-
-// effectiveStatus normalises a workspace's status key to the canonical
-// category it inherits, mirroring issuestatus.Effective exactly. It is
-// reimplemented here, rather than calling issuestatus.Effective directly,
-// because that function requires the full issuestatus.Querier surface while
-// Effective's body only ever calls GetIssueStatusEntryByKey — the one method
-// Queries declares. IsBuiltIn/IsCategory are still the canonical exported
-// predicates; only the glue between them is duplicated.
-func effectiveStatus(ctx context.Context, q Queries, workspaceID pgtype.UUID, status string) string {
-	if issuestatus.IsBuiltIn(status) {
-		return status
-	}
-	entry, err := q.GetIssueStatusEntryByKey(ctx, db.GetIssueStatusEntryByKeyParams{
-		WorkspaceID: workspaceID,
-		Key:         status,
-	})
-	if err != nil {
-		return status
-	}
-	if !issuestatus.IsCategory(entry.Category) {
-		return status
-	}
-	return entry.Category
 }
 
 func parseItemUUID(item map[string]any, key string) (pgtype.UUID, bool) {
