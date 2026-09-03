@@ -2,14 +2,15 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"log/slog"
-	"strings"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
-	"github.com/multica-ai/multica/server/pkg/dbid"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -28,24 +29,24 @@ func (h *Handler) PostPushReplyComment(
 	senderUserID pgtype.UUID,
 	content string,
 ) (engine.PushReplyResult, error) {
-	content = sanitizeNullBytes(strings.TrimSpace(content))
-	if content == "" {
-		return engine.PushReplyResult{Message: "回复内容为空，未提交。"}, nil
+	content, denial, ok := engine.PushReplyPrecondition(
+		uuidToString(push.RecipientUserID), uuidToString(senderUserID), content)
+	if !ok {
+		return denial, nil
 	}
 
-	// The push was addressed to one person. Anyone else replying to it —
-	// possible in a shared IM context, or after a forwarded message — must not
-	// be able to author a decision under that person's name.
-	if uuidToString(senderUserID) != uuidToString(push.RecipientUserID) {
-		return engine.PushReplyResult{Message: "你没有权限回复这条推送。"}, nil
-	}
-
-	// A ledger row outlives membership; re-check rather than trusting it.
+	// A ledger row outlives membership; re-check rather than trusting it. Only
+	// "no such member" is a denial — a connection reset is a fault the sender
+	// cannot act on, and answering it with "你没有权限" would tell a legitimate
+	// member they had lost access and drop their reply with nothing to retry.
 	if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{
 		UserID:      senderUserID,
 		WorkspaceID: push.WorkspaceID,
 	}); err != nil {
-		return engine.PushReplyResult{Message: "你没有权限回复这条推送。"}, nil
+		if errors.Is(err, pgx.ErrNoRows) {
+			return engine.PushReplyResult{Message: engine.PushReplyDenied}, nil
+		}
+		return engine.PushReplyResult{}, err
 	}
 
 	// quick_create pushes carry no issue: there is no thread to inject into.
@@ -53,12 +54,15 @@ func (h *Handler) PostPushReplyComment(
 		return engine.PushReplyResult{Message: "这条推送不能直接回复决策，请打开 Multica 处理。"}, nil
 	}
 
-	issue, err := h.Queries.GetIssue(ctx, push.IssueID)
+	issue, err := h.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID:          push.IssueID,
+		WorkspaceID: push.WorkspaceID,
+	})
 	if err != nil {
-		return engine.PushReplyResult{Message: "关联的 issue 已不存在。"}, nil
-	}
-	if uuidToString(issue.WorkspaceID) != uuidToString(push.WorkspaceID) {
-		return engine.PushReplyResult{Message: "你没有权限回复这条推送。"}, nil
+		if errors.Is(err, pgx.ErrNoRows) {
+			return engine.PushReplyResult{Message: "关联的 issue 已不存在。"}, nil
+		}
+		return engine.PushReplyResult{}, err
 	}
 
 	created, err := h.Queries.CreateComment(ctx, db.CreateCommentParams{

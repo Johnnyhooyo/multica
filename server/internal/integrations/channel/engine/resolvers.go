@@ -3,12 +3,14 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -434,6 +436,36 @@ type PushReplyResult struct {
 	Posted  bool
 	Message string
 }
+
+// PushReplyPrecondition is the half of the reply verdict that reads no rows:
+// normalising what the sender typed, and refusing a reply from anyone the push
+// was not addressed to. It returns the normalised content and ok=true when the
+// caller should go on to the database, or a denial and ok=false when it should
+// not.
+//
+// The sender check is the load-bearing one. A push is addressed to one person,
+// but an IM message can reach this code from someone else — a shared context, a
+// forward — and a comment posted here is authored under the recipient's name and
+// carries their authority to wake an agent. Both ids arrive as strings the
+// caller rendered, and util.UUIDToString renders an unparseable id as "", so an
+// empty sender is refused outright rather than allowed to pair with an equally
+// empty recipient.
+func PushReplyPrecondition(recipientUserID, senderUserID, content string) (string, PushReplyResult, bool) {
+	content = util.SanitizeTextForPostgres(strings.TrimSpace(content))
+	if content == "" {
+		return "", PushReplyResult{Message: "回复内容为空，未提交。"}, false
+	}
+	if senderUserID == "" || senderUserID != recipientUserID {
+		return "", PushReplyResult{Message: PushReplyDenied}, false
+	}
+	return content, PushReplyResult{}, true
+}
+
+// PushReplyDenied is the one answer every authorization miss gives back. The
+// sender learns their reply did not land, and nothing more: which of the checks
+// refused, and whether the issue behind the push exists at all, are not theirs
+// to learn from a message they may not be entitled to.
+const PushReplyDenied = "你没有权限回复这条推送。"
 
 // SessionReader reads the rows the debounced flush + /issue identifier need.
 // Shared across platforms; backed by *db.Queries (the channel-backed store).

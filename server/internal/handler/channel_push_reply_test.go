@@ -21,6 +21,9 @@ func TestPostPushReplyCommentCreatesAMemberComment(t *testing.T) {
 	issueID := dbfx.Issue(t, "Push reply issue", testutil.Cols{
 		"workspace_id": wsID, "status": "in_review",
 	})
+	// The handler writes this one, so the fixture's own cleanup does not know
+	// about it.
+	dbfx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", issueID)
 
 	push := db.ChannelPushMessage{
 		WorkspaceID:     parseUUID(wsID),
@@ -177,6 +180,34 @@ func TestPostPushReplyCommentRejectsEmptyContent(t *testing.T) {
 		t.Fatal("Posted = true for whitespace-only content")
 	}
 	assertNoPushReplyComments(t, issueID, wsID)
+}
+
+// A ledger row names both a workspace and an issue. If they ever disagree —
+// a corrupted row, a bug upstream — the reply must not cross into a workspace
+// the sender's membership was never checked against. The issue lookup is
+// workspace-scoped so the two cannot come apart.
+func TestPostPushReplyCommentRejectsAnIssueInAnotherWorkspace(t *testing.T) {
+	ctx := context.Background()
+	wsID := dbfx.Workspace(t, "Push Reply Home", "push-reply-home-"+uuid.NewString())
+	otherWsID := dbfx.Workspace(t, "Push Reply Foreign", "push-reply-foreign-"+uuid.NewString())
+	userID := dbfx.User(t, "Push Reply Crosser", "push-reply-cross-"+uuid.NewString()+"@multica.ai")
+	dbfx.Member(t, wsID, userID, "member")
+	foreignIssueID := dbfx.Issue(t, "Issue in another workspace", testutil.Cols{"workspace_id": otherWsID})
+
+	push := db.ChannelPushMessage{
+		WorkspaceID:     parseUUID(wsID),
+		RecipientUserID: parseUUID(userID),
+		IssueID:         parseUUID(foreignIssueID),
+	}
+
+	res, err := testHandler.PostPushReplyComment(ctx, push, parseUUID(userID), "确认审核")
+	if err != nil {
+		t.Fatalf("PostPushReplyComment: %v", err)
+	}
+	if res.Posted {
+		t.Fatal("Posted = true against an issue outside the push's workspace")
+	}
+	assertNoPushReplyComments(t, foreignIssueID, otherWsID)
 }
 
 func listPushReplyTestComments(t *testing.T, issueID, workspaceID string) []db.Comment {
