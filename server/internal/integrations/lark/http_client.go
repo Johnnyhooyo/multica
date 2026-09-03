@@ -410,6 +410,52 @@ func (c *httpAPIClient) SendTextMessage(ctx context.Context, p SendTextParams) (
 	return resp.Data.MessageID, nil
 }
 
+// SendDirectMessage posts a plain text IM message straight to a user's
+// open_id, bypassing the chat-level send path entirely: it always sets
+// receive_id_type=open_id (outboundMessageRequest hard-codes chat_id and
+// has no reply-thread need here — an inbox push is a fresh 1:1, never a
+// threaded reply). Returns the message_id so the caller can attribute a
+// later reply back to the push that started it.
+func (c *httpAPIClient) SendDirectMessage(ctx context.Context, p SendDirectParams) (string, error) {
+	if p.OpenID == "" {
+		return "", errors.New("lark http client: missing open_id")
+	}
+	if p.Text == "" {
+		return "", errors.New("lark http client: missing text")
+	}
+	// Same content envelope as SendTextMessage: content = JSON-encoded
+	// {"text": "..."}.
+	contentBytes, err := json.Marshal(map[string]string{"text": p.Text})
+	if err != nil {
+		return "", fmt.Errorf("lark http client: encode text content: %w", err)
+	}
+	q := url.Values{}
+	q.Set("receive_id_type", "open_id")
+	body := map[string]string{
+		"receive_id": string(p.OpenID),
+		"msg_type":   "text",
+		"content":    string(contentBytes),
+	}
+	var resp struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			MessageID string `json:"message_id"`
+		} `json:"data"`
+	}
+	path := "/open-apis/im/v1/messages?" + q.Encode()
+	if err := c.doAuthedJSON(ctx, p.InstallationID, http.MethodPost, path, body, &resp); err != nil {
+		return "", fmt.Errorf("lark http client: send direct message: %w", err)
+	}
+	if resp.Code != 0 || resp.Data.MessageID == "" {
+		if isTokenError(resp.Code) {
+			c.invalidateToken(p.InstallationID.AppID)
+		}
+		return "", &APIError{Op: "send direct message", Code: resp.Code, Msg: resp.Msg}
+	}
+	return resp.Data.MessageID, nil
+}
+
 // SendMarkdownCard posts the agent's reply as an interactive card
 // using Lark's schema-2.0 envelope with a single `tag: "markdown"`
 // body element. Lark's client renders the markdown into formatted
