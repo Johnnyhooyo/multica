@@ -90,7 +90,7 @@ type EntryReader interface {
 // Querier is the slice of the generated query set this package needs. Taking an
 // interface keeps the resolver testable without a live database.
 type Querier interface {
-	GetIssueStatusEntryByKey(ctx context.Context, arg db.GetIssueStatusEntryByKeyParams) (db.IssueStatus, error)
+	EntryReader
 	ListIssueStatusEntries(ctx context.Context, arg db.ListIssueStatusEntriesParams) ([]db.IssueStatus, error)
 	SeedIssueStatusEntries(ctx context.Context, workspaceID pgtype.UUID) error
 	ListIssueStatusKeysByCategories(ctx context.Context, arg db.ListIssueStatusKeysByCategoriesParams) ([]string, error)

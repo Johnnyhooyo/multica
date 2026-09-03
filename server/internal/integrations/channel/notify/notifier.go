@@ -190,8 +190,24 @@ func (n *Notifier) channelOrder() []string {
 	return order
 }
 
+// itemString reads a string field from an inbox_item map. Nullable columns
+// reach the bus as *string, because inboxItemToResponse builds them with
+// uuidToPtr (internal/handler/inbox.go:245), so both shapes have to be
+// accepted — asserting only string silently drops every nullable field.
+func itemString(item map[string]any, key string) string {
+	switch v := item[key].(type) {
+	case string:
+		return v
+	case *string:
+		if v != nil {
+			return *v
+		}
+	}
+	return ""
+}
+
 func parseItemUUID(item map[string]any, key string) (pgtype.UUID, bool) {
-	s, _ := item[key].(string)
+	s := itemString(item, key)
 	if s == "" {
 		return pgtype.UUID{}, false
 	}
@@ -224,29 +240,13 @@ func pushAppURL() string {
 // pushItemIssueID extracts issue_id when present. Chat-only notifications
 // (quick_create_failed, quick_create_unconfirmed) have no issue_id.
 func pushItemIssueID(item map[string]any) string {
-	switch v := item["issue_id"].(type) {
-	case *string:
-		if v != nil {
-			return *v
-		}
-	case string:
-		return v
-	}
-	return ""
+	return itemString(item, "issue_id")
 }
 
 // pushItemBody extracts the body/description string from an inbox_item map.
 // Body may arrive as *string (nil-able JSON field), string, or missing.
 func pushItemBody(item map[string]any) string {
-	switch v := item["body"].(type) {
-	case *string:
-		if v != nil {
-			return *v
-		}
-	case string:
-		return v
-	}
-	return ""
+	return itemString(item, "body")
 }
 
 // pushLink builds the deep link: <app base>/<slug or workspace uuid>/issues/<issue_id>
