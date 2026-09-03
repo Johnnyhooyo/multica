@@ -3,6 +3,7 @@ package wecom
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/notify"
@@ -64,5 +65,100 @@ func TestDeliverDMHandsOffWhenThisReplicaHasNoSocket(t *testing.T) {
 	}
 	if res.State != notify.StateHandedOff {
 		t.Errorf("State = %v, want StateHandedOff", res.State)
+	}
+}
+
+// sentMarkdown reads the markdown body out of the first send frame. The
+// content sits under the "markdown" object, not at the top level.
+func sentMarkdown(t *testing.T, conn *recordingConn) string {
+	t.Helper()
+	md, ok := conn.sendBody(t, 0)["markdown"].(map[string]any)
+	if !ok {
+		t.Fatalf("send frame has no markdown object: %v", conn.sendBody(t, 0))
+	}
+	s, _ := md["content"].(string)
+	if s == "" {
+		t.Fatal("send frame markdown content is empty")
+	}
+	return s
+}
+
+// The push text is assembled in the shared notify package, which splices a
+// member-authored issue title and body into it. markdown.go's rule is that
+// every WeCom caller doing that runs breakMemberLinks first: a title like
+// "[click here](http://evil.example)" would otherwise arrive as a working link
+// inside a message the bot signs.
+func TestDeliverDMBreaksMemberAuthoredLinks(t *testing.T) {
+	q := &fakeOutboundQueries{}
+	o, instID, conn := newOutboundWithConn(t, q)
+	binding := db.ChannelUserBinding{InstallationID: instID, ChannelUserID: "T_USER_1"}
+
+	if _, err := o.DeliverDM(context.Background(), testPushRef, binding,
+		"**[in_review] [重置密码](http://evil.example)**"); err != nil {
+		t.Fatalf("DeliverDM: %v", err)
+	}
+
+	sent := sentMarkdown(t, conn)
+	if strings.Contains(sent, "](") {
+		t.Errorf("member-authored link survived into the bot message: %q", sent)
+	}
+	if !strings.Contains(sent, "重置密码") {
+		t.Errorf("the guard dropped the title text instead of separating it: %q", sent)
+	}
+}
+
+// WeCom refuses an over-long markdown body, so the cap has to be enforced on
+// this side of the shared renderer, which has no per-platform length budget.
+//
+// The link case covers the seam between the two adjustments: truncation runs
+// after breakMemberLinks and must not undo it. It only drops a suffix, so it
+// cannot put a "]" back beside a "(" — this pins that.
+func TestDeliverDMTruncatesToTheMarkdownLimit(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+	}{
+		{"a long body", strings.Repeat("蒜", inboxMarkdownMaxLen+500)},
+		{"a long body carrying link syntax",
+			strings.Repeat("[点这里](http://evil.example)", inboxMarkdownMaxLen)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := &fakeOutboundQueries{}
+			o, instID, conn := newOutboundWithConn(t, q)
+			binding := db.ChannelUserBinding{InstallationID: instID, ChannelUserID: "T_USER_1"}
+
+			if _, err := o.DeliverDM(context.Background(), testPushRef, binding, tt.text); err != nil {
+				t.Fatalf("DeliverDM: %v", err)
+			}
+
+			sent := sentMarkdown(t, conn)
+			if got := len([]rune(sent)); got > inboxMarkdownMaxLen {
+				t.Errorf("sent %d runes, want at most %d", got, inboxMarkdownMaxLen)
+			}
+			if strings.Contains(sent, "](") {
+				t.Error("truncation put a close bracket back next to an open paren")
+			}
+		})
+	}
+}
+
+func TestTruncateRunes(t *testing.T) {
+	cases := []struct {
+		in     string
+		max    int
+		expect string
+	}{
+		{"abc", 0, ""},
+		{"abc", 3, "abc"},
+		{"abc", 2, "ab"},
+		{"你好世界", 2, "你好"},
+		{"你好世界", 4, "你好世界"},
+		{"你好世界", 5, "你好世界"},
+	}
+	for _, tc := range cases {
+		if got := truncateRunes(tc.in, tc.max); got != tc.expect {
+			t.Errorf("truncateRunes(%q,%d)=%q; want %q", tc.in, tc.max, got, tc.expect)
+		}
 	}
 }

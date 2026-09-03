@@ -219,11 +219,12 @@ func parseItemUUID(item map[string]any, key string) (pgtype.UUID, bool) {
 	return u, true
 }
 
-// pushAppURL resolves the frontend URL for building the deep link, matching
-// wecom/inbox_message.go's inboxAppURL precedence exactly: WECOM_APP_URL,
-// then MULTICA_APP_URL, then FRONTEND_ORIGIN. Only HTTPS values are
-// accepted; a non-HTTPS override is silently dropped so a misconfigured env
-// cannot leak an http:// URL into a user chat.
+// pushAppURL resolves the frontend URL for building the deep link. Precedence
+// is WECOM_APP_URL, then MULTICA_APP_URL, then FRONTEND_ORIGIN — WeCom's
+// per-tenant override stays first because it was the only push channel before
+// this package existed and its deployments already set it. Only HTTPS values
+// are accepted; a non-HTTPS override is silently dropped so a misconfigured
+// env cannot leak an http:// URL into a user chat.
 func pushAppURL() string {
 	for _, name := range []string{"WECOM_APP_URL", "MULTICA_APP_URL", "FRONTEND_ORIGIN"} {
 		v := strings.TrimSpace(os.Getenv(name))

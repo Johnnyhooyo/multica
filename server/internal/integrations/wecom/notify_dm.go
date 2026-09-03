@@ -2,11 +2,17 @@ package wecom
 
 import (
 	"context"
+	"unicode/utf8"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/notify"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
+
+// aibot markdown size cap. WeCom rejects the whole frame past ~4096 chars
+// while still acking the send, so an over-long push is silently lost rather
+// than reported. 4000 leaves headroom.
+const inboxMarkdownMaxLen = 4000
 
 // DeliverDM sends an inbox push to a bound member over the aibot socket.
 //
@@ -21,9 +27,27 @@ import (
 // no reply context, so a WeCom push cannot be replied to no matter what we
 // record. Reporting an empty id keeps that honest rather than writing a
 // ledger row no inbound message will ever match.
+//
+// The two markdown adjustments below stay here rather than in notify.
+// renderPush: both answer to this renderer specifically — the space trick in
+// breakMemberLinks is verified against WeCom's parser and nothing else, and
+// the cap is WeCom's frame limit — so a shared renderer that applied either
+// would be imposing one platform's rules on every other.
 func (o *Outbound) DeliverDM(ctx context.Context, ref notify.PushRef, binding db.ChannelUserBinding, text string) (notify.DeliverResult, error) {
 	if text == "" {
 		return notify.DeliverResult{}, nil
+	}
+	// renderPush splices a member-authored issue title and body into a
+	// message that goes out signed by the bot, so it runs through the same
+	// guard every other such caller does (markdown.go). Before the cap, not
+	// after: each break inserts a rune.
+	//
+	// Whole-text rather than per-field: renderPush emits no markdown link of
+	// its own — the deep link is a bare URL — so there is no "](" or "]:" in
+	// the scaffolding for the guard to separate.
+	text = breakMemberLinks(text)
+	if utf8.RuneCountInString(text) > inboxMarkdownMaxLen {
+		text = truncateRunes(text, inboxMarkdownMaxLen)
 	}
 	var sender *wsSender
 	if o.senders != nil {
@@ -51,4 +75,27 @@ func (o *Outbound) DeliverDM(ctx context.Context, ref notify.PushRef, binding db
 	o.logger.DebugContext(ctx, "wecom outbound: inbox delivered via bot",
 		"installation_id", uuidStringPub(binding.InstallationID))
 	return notify.DeliverResult{State: notify.StateDelivered}, nil
+}
+
+// truncateRunes trims s to at most maxRunes runes. Rune-based rather than
+// byte-based so the cut never splits a Chinese character.
+//
+// It only ever drops a suffix, which is what lets it run after
+// breakMemberLinks without undoing it: dropping characters cannot put a "]"
+// back beside a "(" or a ":".
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	i := 0
+	for pos := range s {
+		if i == maxRunes {
+			return s[:pos]
+		}
+		i++
+	}
+	return s
 }
