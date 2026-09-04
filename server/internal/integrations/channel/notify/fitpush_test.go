@@ -254,3 +254,37 @@ func first(s string) string {
 	}
 	return s
 }
+
+// PlainHead undoes renderPush's title emphasis for platforms that render no
+// markdown. It must touch that and nothing else: the body is the member's own
+// words, and the deep link is the recipient's only route in on a platform
+// whose pushes are not replyable.
+func TestPlainHead(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			"renderPush's full shape",
+			"**[状态变更] Ship it**\nbody\nhttps://app.example.com/a/issues/x\n直接回复本条消息即可处理。",
+			"[状态变更] Ship it\nbody\nhttps://app.example.com/a/issues/x\n直接回复本条消息即可处理。",
+		},
+		{"title only", "**[状态变更] Ship it**", "[状态变更] Ship it"},
+		{
+			// The body is the member's text; whatever they wrote stays.
+			"a body of its own asterisks is left alone",
+			"**[状态变更] T**\nsee **this**",
+			"[状态变更] T\nsee **this**",
+		},
+		{"an unemphasised head is untouched", "plain\nbody", "plain\nbody"},
+		{"empty", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := PlainHead(tt.in); got != tt.want {
+				t.Errorf("PlainHead(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}

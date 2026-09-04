@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -93,7 +94,7 @@ func newTestNotifier(t *testing.T, q *fakeQueries, a *fakeAdapter) *Notifier {
 	if q.binding.ChannelUserID == "" {
 		q.binding.ChannelUserID = "ou_target"
 	}
-	n := New(q, slog.Default())
+	n := New(q, slog.Default(), nil)
 	n.Register(map[string]DMDeliverer{"lark": a})
 	return n
 }
@@ -320,6 +321,213 @@ func TestNotifierIgnoresAChannelWithNoAdapter(t *testing.T) {
 
 	if a.calls != 0 {
 		t.Errorf("adapter calls = %d, want 0", a.calls)
+	}
+}
+
+// blockingAdapter stands in for a real IM send: it holds the caller until
+// released, the way an HTTPS round trip to Lark holds it for as long as the
+// platform takes.
+type blockingAdapter struct {
+	entered  chan struct{}
+	release  chan struct{}
+	fakeOnce bool
+}
+
+func (a *blockingAdapter) DeliverDM(context.Context, PushRef, db.ChannelUserBinding, string) (DeliverResult, error) {
+	if !a.fakeOnce {
+		a.fakeOnce = true
+		close(a.entered)
+	}
+	<-a.release
+	return DeliverResult{State: StateDelivered, MessageID: "om_x"}, nil
+}
+
+func (a *blockingAdapter) AcceptsReplies() bool { return true }
+
+// The bus dispatches inline on the publishing goroutine, and inbox:new is
+// published from inside the HTTP request that changed the issue — once per
+// recipient. If the subscribed handler sent the DM inline, a status change to
+// in_review would stall that request on an IM round trip. Subscribe therefore
+// detaches; this pins that, because the cost is invisible in every test that
+// calls HandleInboxNew directly.
+func TestSubscribedPushDoesNotBlockThePublisher(t *testing.T) {
+	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+	q.binding.InstallationID = mustUUID(t, testInstall)
+	q.binding.ChannelType = "lark"
+	q.binding.ChannelUserID = "ou_target"
+
+	a := &blockingAdapter{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(a.release)
+
+	n := New(q, slog.Default(), nil)
+	n.Register(map[string]DMDeliverer{"lark": a})
+
+	bus := events.New()
+	n.Subscribe(bus)
+
+	done := make(chan struct{})
+	go func() {
+		bus.Publish(inReviewEvent())
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Publish did not return while the adapter was still sending: the push is inline on the caller's goroutine")
+	}
+
+	// And it really did run — a Publish that returns fast because nothing
+	// was dispatched would pass the assertion above for the wrong reason.
+	select {
+	case <-a.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the adapter was never called: the subscription did not dispatch")
+	}
+}
+
+type recordedPush struct {
+	outcome     string
+	channelType string
+}
+
+type fakeMetrics struct {
+	pushes []recordedPush
+}
+
+func (m *fakeMetrics) RecordPush(outcome, channelType string) {
+	m.pushes = append(m.pushes, recordedPush{outcome, channelType})
+}
+
+// Every inbox:new the notifier sees ends in exactly one outcome, and the
+// outcome names why. That "exactly one" is what makes delivered/total a ratio
+// an operator can read straight off a dashboard — a path that records twice
+// inflates the denominator, and one that records nothing makes a whole class
+// of failure invisible, which is the state this counter exists to end.
+//
+// The channel_type half is asserted too: it is empty exactly on the paths that
+// give up before a binding is resolved, and attributing a skip to the wrong
+// platform would point an investigation at the wrong adapter.
+func TestNotifierRecordsExactlyOneOutcomePerEvent(t *testing.T) {
+	tests := []struct {
+		name        string
+		setup       func(*fakeQueries, *fakeAdapter)
+		event       func() events.Event
+		outcome     string
+		channelType string
+	}{
+		{
+			name:        "a replyable push that landed",
+			outcome:     OutcomeDelivered,
+			channelType: "lark",
+		},
+		{
+			name: "relayed to the replica holding the socket",
+			setup: func(_ *fakeQueries, a *fakeAdapter) {
+				a.result = DeliverResult{State: StateHandedOff}
+			},
+			outcome:     OutcomeHandedOff,
+			channelType: "lark",
+		},
+		{
+			name: "the platform refused the send",
+			setup: func(_ *fakeQueries, a *fakeAdapter) {
+				a.err = errors.New("platform refused the message")
+			},
+			outcome:     OutcomeFailed,
+			channelType: "lark",
+		},
+		{
+			name: "sent, but the reply ledger write failed",
+			setup: func(q *fakeQueries, _ *fakeAdapter) {
+				q.createErr = errors.New("connection reset")
+			},
+			outcome:     OutcomeRecordFailed,
+			channelType: "lark",
+		},
+		{
+			name: "a transition the whitelist rejects",
+			event: func() events.Event {
+				e := inReviewEvent()
+				e.Payload.(map[string]any)["item"].(map[string]any)["issue_status"] = "done"
+				return e
+			},
+			outcome: OutcomeNotWhitelisted,
+		},
+		{
+			name: "an agent recipient has no IM identity",
+			event: func() events.Event {
+				e := inReviewEvent()
+				e.Payload.(map[string]any)["item"].(map[string]any)["recipient_type"] = "agent"
+				return e
+			},
+			outcome: OutcomeNotMember,
+		},
+		{
+			name: "the member is not bound to any channel",
+			setup: func(q *fakeQueries, _ *fakeAdapter) {
+				q.bindingErr = pgx.ErrNoRows
+			},
+			outcome: OutcomeUnbound,
+		},
+		{
+			name: "bound to a platform this build cannot push to",
+			setup: func(q *fakeQueries, _ *fakeAdapter) {
+				q.binding.ChannelType = "dingtalk"
+			},
+			outcome:     OutcomeNoAdapter,
+			channelType: "dingtalk",
+		},
+		{
+			name: "the payload is not the shape we publish",
+			event: func() events.Event {
+				return events.Event{
+					Type: protocol.EventInboxNew, WorkspaceID: testWorkspace, Payload: "nonsense",
+				}
+			},
+			outcome: OutcomeMalformed,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+			a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_1"}}
+			m := &fakeMetrics{}
+			n := newTestNotifier(t, q, a)
+			n.metrics = m
+			// After newTestNotifier, which fills the binding defaults a setup
+			// overriding ChannelType has to win against.
+			if tt.setup != nil {
+				tt.setup(q, a)
+			}
+			e := inReviewEvent()
+			if tt.event != nil {
+				e = tt.event()
+			}
+
+			n.HandleInboxNew(e)
+
+			if len(m.pushes) != 1 {
+				t.Fatalf("recorded %v, want exactly one outcome", m.pushes)
+			}
+			got := m.pushes[0]
+			if got.outcome != tt.outcome || got.channelType != tt.channelType {
+				t.Errorf("recorded (%q, %q), want (%q, %q)",
+					got.outcome, got.channelType, tt.outcome, tt.channelType)
+			}
+		})
+	}
+}
+
+// A nil sink is a supported configuration, not a missing wire: the metrics
+// endpoint is optional, and main.go leaves the field nil when it is off.
+func TestNotifierPushesWithNoMetricsSink(t *testing.T) {
+	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_1"}}
+	newTestNotifier(t, q, a).HandleInboxNew(inReviewEvent())
+
+	if a.calls != 1 {
+		t.Errorf("adapter calls = %d, want 1", a.calls)
 	}
 }
 

@@ -240,9 +240,12 @@ type RouterOptions struct {
 	// WecomMetrics is the WeCom adapter's health sink. Nil discards every
 	// counter, which is what a deployment with /metrics turned off gets.
 	WecomMetrics *obsmetrics.WecomMetrics
-	DaemonHub    *daemonws.Hub
-	DaemonWakeup service.TaskWakeupNotifier
-	FeatureFlags *featureflag.Service
+	// ChannelPushMetrics is the inbox-push notifier's sink, nil-safe on the
+	// same terms.
+	ChannelPushMetrics *obsmetrics.ChannelPushMetrics
+	DaemonHub          *daemonws.Hub
+	DaemonWakeup       service.TaskWakeupNotifier
+	FeatureFlags       *featureflag.Service
 	// HeartbeatScheduler, when non-nil, replaces the default synchronous
 	// passthrough scheduler on the constructed Handler. main.go injects a
 	// BatchedHeartbeatScheduler here so the caller can also drive Run/Stop;
@@ -530,7 +533,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// DM. Built unconditionally for the same reason channelRouter is —
 	// it is platform-agnostic, and adapters register into it below. With no
 	// adapters registered it does nothing.
-	pushNotifier := notify.New(queries, slog.Default())
+	pushNotifier := notify.New(queries, slog.Default(), opts.ChannelPushMetrics)
 	pushAdapters := map[string]notify.DMDeliverer{}
 	// Media intent-ledger reconciler: settles uploaded-but-unbound objects.
 	// Built ONLY when a storage backend exists — store is nil when S3 is not

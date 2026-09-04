@@ -46,7 +46,12 @@ func (d *dmDeliverer) DeliverDM(ctx context.Context, _ notify.PushRef, binding d
 	messageID, err := d.client.SendDirectMessage(ctx, SendDirectParams{
 		InstallationID: creds,
 		OpenID:         OpenID(binding.ChannelUserID),
-		Text:           text,
+		// PlainHead, because SendDirectMessage posts msg_type=text and Lark
+		// renders no markdown there — the title's "**" would reach the
+		// recipient as two literal asterisks on every push. A markdown card
+		// would render it, but cards address a chat_id, and this path
+		// deliberately opens a fresh 1:1 by open_id.
+		Text: notify.PlainHead(text),
 	})
 	if err != nil {
 		return notify.DeliverResult{}, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -55,6 +56,32 @@ func TestDeliverDMReturnsTheLarkMessageID(t *testing.T) {
 	}
 	if c.lastText == "" {
 		t.Error("sent empty text")
+	}
+}
+
+// SendDirectMessage posts msg_type=text, which Lark renders verbatim. The
+// shared renderer wraps the title in "**" because WeCom's aibot does render
+// markdown, so the adapter has to undo it here or every Lark push opens with
+// two literal asterisks — the first thing a recipient sees.
+func TestDeliverDMSendsNoLiteralMarkdownToLark(t *testing.T) {
+	c := &recordingDMClient{messageID: "om_abc123"}
+	d := NewDMDeliverer(c, testDMCreds, slog.Default())
+
+	if _, err := d.DeliverDM(context.Background(), notify.PushRef{},
+		db.ChannelUserBinding{ChannelUserID: "ou_recipient"},
+		"**[状态变更] Ship it**\nhttps://app.example.com/acme/issues/x"); err != nil {
+		t.Fatalf("DeliverDM: %v", err)
+	}
+	if strings.Contains(c.lastText, "**") {
+		t.Errorf("sent %q; Lark shows these asterisks to the user", c.lastText)
+	}
+	if !strings.HasPrefix(c.lastText, "[状态变更] Ship it") {
+		t.Errorf("sent %q, want the title intact without its emphasis", c.lastText)
+	}
+	// The rest of the push has to survive: the deep link is the recipient's
+	// route into the app.
+	if !strings.Contains(c.lastText, "https://app.example.com/acme/issues/x") {
+		t.Errorf("sent %q, want the deep link preserved", c.lastText)
 	}
 }
 

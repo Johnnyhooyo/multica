@@ -555,6 +555,7 @@ func main() {
 	var channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics
 	var channelLeaseMetrics *obsmetrics.ChannelLeaseMetrics
 	var wecomMetrics *obsmetrics.WecomMetrics
+	var channelPushMetrics *obsmetrics.ChannelPushMetrics
 	if metricsConfig.Enabled() {
 		metricsRegistry := obsmetrics.NewRegistry(obsmetrics.RegistryOptions{
 			Pool:     pool,
@@ -568,6 +569,7 @@ func main() {
 		channelMediaMetrics = metricsRegistry.ChannelMedia
 		channelLeaseMetrics = metricsRegistry.ChannelLease
 		wecomMetrics = metricsRegistry.Wecom
+		channelPushMetrics = metricsRegistry.ChannelPush
 		// Forward inbound daemon WS frames into the per-kind counter so
 		// dashboards can split heartbeat / unknown / invalid traffic.
 		if daemonHub != nil {
@@ -602,6 +604,7 @@ func main() {
 		ChannelLeaseMetrics: channelLeaseMetrics,
 		ChannelLeaseRedis:   channelLeaseRedis,
 		WecomMetrics:        wecomMetrics,
+		ChannelPushMetrics:  channelPushMetrics,
 		DaemonHub:           daemonHub,
 		DaemonWakeup:        daemonWakeup,
 		WecomSenders:        wecomSenders,

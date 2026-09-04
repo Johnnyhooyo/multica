@@ -35,18 +35,60 @@ type Queries interface {
 	CreateChannelPushMessage(ctx context.Context, arg db.CreateChannelPushMessageParams) (db.ChannelPushMessage, error)
 }
 
+// Metrics records the fate of every push. The notifier defines the interface
+// rather than importing the metrics package so this package stays free of a
+// Prometheus dependency; *metrics.ChannelPushMetrics satisfies it.
+//
+// channelType is "" on the paths that end before a binding is found — the
+// recipient's platform is not known yet, and there is nothing to attribute.
+type Metrics interface {
+	RecordPush(outcome, channelType string)
+}
+
+// The outcomes RecordPush reports. Exactly one is recorded per inbox:new the
+// notifier accepts, so delivered/(everything else) is a ratio a dashboard can
+// read directly.
+//
+// The split matters more than the total: skipped_* are routine and expected
+// (most inbox rows are not review moments, most members are not bound), while
+// malformed and failed are defects. A single "not pushed" counter would hide
+// a broken adapter inside the ordinary skip volume.
+const (
+	OutcomeDelivered      = "delivered"       // sent, and recorded if replyable
+	OutcomeHandedOff      = "handed_off"      // relayed to the replica holding the socket
+	OutcomeFailed         = "failed"          // the adapter returned an error
+	OutcomeRecordFailed   = "record_failed"   // sent, but the reply ledger write failed
+	OutcomeNotWhitelisted = "not_whitelisted" // the type/status is not a decision moment
+	OutcomeNotMember      = "not_member"      // an agent recipient; no IM identity
+	OutcomeUnbound        = "unbound"         // the member has no IM binding
+	OutcomeNoAdapter      = "no_adapter"      // bound to a platform this build cannot push to
+	OutcomeEmpty          = "empty"           // nothing worth sending after rendering
+	OutcomeMalformed      = "malformed"       // the payload was not the shape we publish
+)
+
 // Notifier forwards whitelisted inbox notifications to bound IM channels.
 type Notifier struct {
 	q        Queries
 	logger   *slog.Logger
+	metrics  Metrics
 	adapters map[string]DMDeliverer
 }
 
-func New(q Queries, logger *slog.Logger) *Notifier {
+// New builds the notifier. metrics may be nil, which discards every
+// observation — the metrics endpoint is optional in this deployment
+// (obsmetrics.ConfigFromEnv), so a nil sink is a supported configuration, not
+// a missing wire.
+func New(q Queries, logger *slog.Logger, metrics Metrics) *Notifier {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Notifier{q: q, logger: logger, adapters: map[string]DMDeliverer{}}
+	return &Notifier{q: q, logger: logger, metrics: metrics, adapters: map[string]DMDeliverer{}}
+}
+
+func (n *Notifier) record(outcome, channelType string) {
+	if n.metrics != nil {
+		n.metrics.RecordPush(outcome, channelType)
+	}
 }
 
 // Register installs the per-channel_type adapters. Channels with no adapter
@@ -57,8 +99,23 @@ func (n *Notifier) Register(adapters map[string]DMDeliverer) {
 	}
 }
 
+// Subscribe attaches the notifier to the bus, detached.
+//
+// The bus dispatches handlers inline on the publishing goroutine, and
+// inbox:new is published from inside notifySubscribers' per-recipient loop
+// (cmd/server/notification_listeners.go) — which itself runs on the HTTP
+// request that changed the issue. Handling it inline would charge that
+// request an IM round trip per recipient, up to deliverTimeout each. Nothing
+// downstream waits on the push, so it goes to its own goroutine.
+//
+// The goroutine is safe: HandleInboxNew builds its own context and closes
+// over nothing from the caller. Wrapping here rather than inside
+// HandleInboxNew keeps direct calls synchronous, which is what every test
+// and the end-to-end handler test rely on.
 func (n *Notifier) Subscribe(bus *events.Bus) {
-	bus.Subscribe(protocol.EventInboxNew, n.HandleInboxNew)
+	bus.Subscribe(protocol.EventInboxNew, func(e events.Event) {
+		go n.HandleInboxNew(e)
+	})
 }
 
 // HandleInboxNew is the inbox:new subscriber.
@@ -68,28 +125,38 @@ func (n *Notifier) Subscribe(bus *events.Bus) {
 // that failed. In all of them the member still sees the notification in the
 // in-app inbox, which is the degradation WeCom's original path established.
 //
+// Every one of those paths still reports an outcome, because "no-op" and
+// "silently broken" look identical from outside otherwise. A malformed
+// payload additionally logs: it means a producer changed the shape of what it
+// publishes, which no amount of counting will explain.
+//
 // Muting needs no handling here. notifTypeToGroup + isNotifMuted run before
 // the inbox row is created, so a muted notification produces no row, no
 // EventInboxNew, and therefore no push.
 func (n *Notifier) HandleInboxNew(e events.Event) {
 	payload, ok := e.Payload.(map[string]any)
 	if !ok {
+		n.malformed("payload is not a map", e.WorkspaceID)
 		return
 	}
 	item, ok := payload["item"].(map[string]any)
 	if !ok {
+		n.malformed("payload carries no item map", e.WorkspaceID)
 		return
 	}
 	// Only member recipients. Agents have no IM identity to DM.
 	if rt, _ := item["recipient_type"].(string); rt != "member" {
+		n.record(OutcomeNotMember, "")
 		return
 	}
 	recipientID, ok := parseItemUUID(item, "recipient_id")
 	if !ok {
+		n.malformed("item has no parseable recipient_id", e.WorkspaceID)
 		return
 	}
 	workspaceID, ok := parseItemUUID(item, "workspace_id")
 	if !ok {
+		n.malformed("item has no parseable workspace_id", e.WorkspaceID)
 		return
 	}
 	inboxItemID, _ := parseItemUUID(item, "id")
@@ -105,20 +172,35 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	}
 	decision := Decide(notifType, effective)
 	if !decision.Push {
+		n.record(OutcomeNotWhitelisted, "")
 		return
 	}
 
 	binding, ok := n.findBinding(ctx, workspaceID, recipientID)
 	if !ok {
+		n.record(OutcomeUnbound, "")
 		return
 	}
 	adapter, ok := n.adapters[binding.ChannelType]
 	if !ok {
+		// Routine in a deployment that runs only some platforms, but also what
+		// a mistyped adapter map key looks like — and that key silently
+		// disables the whole feature for that platform.
+		n.logger.DebugContext(ctx, "notify: no push adapter for the member's channel",
+			"channel_type", binding.ChannelType,
+			"workspace_id", util.UUIDToString(workspaceID))
+		n.record(OutcomeNoAdapter, binding.ChannelType)
 		return
 	}
 
 	slug := ""
-	if ws, wsErr := n.q.GetWorkspace(ctx, workspaceID); wsErr == nil {
+	if ws, wsErr := n.q.GetWorkspace(ctx, workspaceID); wsErr != nil {
+		// Not fatal: pushLink falls back to the workspace uuid, so the deep
+		// link still resolves. Worth a line because it is a database fault on
+		// a path that otherwise reports success.
+		n.logger.WarnContext(ctx, "notify: workspace lookup failed; the deep link will use the uuid",
+			"error", wsErr, "workspace_id", util.UUIDToString(workspaceID))
+	} else {
 		slug = ws.Slug
 	}
 	// A push is only offered as replyable when the notification type allows a
@@ -127,6 +209,11 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	replyable := decision.Replyable && adapter.AcceptsReplies()
 	text := renderPush(item, util.UUIDToString(workspaceID), slug, replyable)
 	if text == "" {
+		// renderPush returns "" only when the item has neither a title nor a
+		// type, which the whitelist should already have rejected.
+		n.logger.WarnContext(ctx, "notify: whitelisted item rendered to nothing",
+			"notif_type", notifType, "workspace_id", util.UUIDToString(workspaceID))
+		n.record(OutcomeEmpty, binding.ChannelType)
 		return
 	}
 
@@ -139,6 +226,11 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 		n.logger.WarnContext(ctx, "notify: push failed",
 			"error", err, "channel_type", binding.ChannelType,
 			"workspace_id", util.UUIDToString(workspaceID))
+		n.record(OutcomeFailed, binding.ChannelType)
+		return
+	}
+	if res.State == StateHandedOff {
+		n.record(OutcomeHandedOff, binding.ChannelType)
 		return
 	}
 
@@ -146,6 +238,7 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	// to. StateHandedOff has no id by construction (the relay is one-way),
 	// and some platforms deliver without returning one at all.
 	if !replyable || res.State != StateDelivered || res.MessageID == "" {
+		n.record(OutcomeDelivered, binding.ChannelType)
 		return
 	}
 	issueID, _ := parseItemUUID(item, "issue_id")
@@ -159,9 +252,26 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 		InboxItemID:      inboxItemID,
 	}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		// ErrNoRows is the ON CONFLICT DO NOTHING path: already recorded.
+		//
+		// Its own outcome rather than "failed": the member got the push and
+		// can act on it in the app, but the reply they were just invited to
+		// send will fall through to the ordinary chat path. That is a
+		// different user-visible failure from a push that never arrived.
 		n.logger.WarnContext(ctx, "notify: recording the push for reply attribution failed",
 			"error", err, "channel_type", binding.ChannelType)
+		n.record(OutcomeRecordFailed, binding.ChannelType)
+		return
 	}
+	n.record(OutcomeDelivered, binding.ChannelType)
+}
+
+// malformed reports a payload that is not the shape cmd/server publishes.
+// Always a producer bug, never a runtime condition, so it logs as well as
+// counts — the counter says it is happening, the log says which field.
+func (n *Notifier) malformed(reason, workspaceID string) {
+	n.logger.Warn("notify: malformed inbox:new payload",
+		"reason", reason, "workspace_id", workspaceID)
+	n.record(OutcomeMalformed, "")
 }
 
 // findBinding picks which channel to DM and returns the binding it found.
@@ -301,6 +411,30 @@ func pushTypeLabel(t string) string {
 // replyHint is appended to a replyable push so the recipient knows they can
 // act on it without leaving IM.
 const replyHint = "直接回复本条消息即可处理。"
+
+// PlainHead removes the emphasis renderPush wraps the title line in, for
+// platforms whose message body renders no markdown. Lark's msg_type=text is
+// the case in hand — it shows the asterisks literally
+// (integrations/lark/http_client.go documents this against SendMarkdownCard),
+// so without this every Lark push opens with visible "**".
+//
+// It is the adapter's call rather than the renderer's because WeCom's aibot
+// does render markdown, and the bold title is the only thing separating the
+// title from the body there.
+//
+// Like FitPush it reads renderPush's grammar back: the emphasis is on the
+// first line and nowhere else, so only the first line is touched and a
+// member-authored body that happens to contain "**" is left as they wrote it.
+func PlainHead(text string) string {
+	head, rest, found := strings.Cut(text, "\n")
+	if strings.HasPrefix(head, "**") && strings.HasSuffix(head, "**") && len(head) > 4 {
+		head = head[2 : len(head)-2]
+	}
+	if !found {
+		return head
+	}
+	return head + "\n" + rest
+}
 
 // FitPush trims a rendered push to at most maxRunes runes without dropping the
 // parts the recipient acts on. It is the counterpart to renderPush: the body is
