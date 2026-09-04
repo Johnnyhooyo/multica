@@ -108,3 +108,27 @@ func (h *Handler) PostPushReplyComment(
 	)
 	return engine.PushReplyResult{Posted: true, Message: "已记录，Multica 正在处理。"}, nil
 }
+
+// LookupPush finds the push a reply is answering. A miss is not an error:
+// nearly every inbound reply is ordinary chat, and the router uses the bool
+// to fall through to that path.
+func (h *Handler) LookupPush(ctx context.Context, installationID pgtype.UUID, channelMessageID string) (db.ChannelPushMessage, bool, error) {
+	if channelMessageID == "" {
+		return db.ChannelPushMessage{}, false, nil
+	}
+	row, err := h.Queries.FindChannelPushMessage(ctx, db.FindChannelPushMessageParams{
+		InstallationID:   installationID,
+		ChannelMessageID: channelMessageID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.ChannelPushMessage{}, false, nil
+	}
+	if err != nil {
+		return db.ChannelPushMessage{}, false, err
+	}
+	return row, true, nil
+}
+
+// Compile-time assertion: a future signature drift on either side fails the
+// build rather than silently disabling the feature.
+var _ engine.PushReplyPoster = (*Handler)(nil)

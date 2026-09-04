@@ -655,6 +655,9 @@ func main() {
 	// Source-context cleanup is object-store work, so it gets its own goroutine
 	// instead of a slot in the runtime sweep tick.
 	go runSourceContextSweeper(sweepCtx, taskSvc)
+	// Retention sweep for the reply-attribution ledger (channel_push_message).
+	// Hourly and cheap, so its own goroutine costs nothing extra.
+	go runChannelPushSweeper(sweepCtx, queries)
 	go heartbeatScheduler.Run(sweepCtx)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	if autopilotSvc.QuotaEnabled() {

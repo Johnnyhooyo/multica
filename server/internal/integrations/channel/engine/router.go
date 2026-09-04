@@ -199,7 +199,18 @@ func (r *Router) Handle(ctx context.Context, msg channel.InboundMessage) error {
 	// Preserve the user's original normalized text before any shared command
 	// rewrites. Session binders pass this source to command classifiers while
 	// Text remains the agent-readable body.
-	if msg.CommandText == "" {
+	//
+	// Gated to text messages: every adapter that emits a non-text message
+	// (image, file, audio, video, sticker) sets CommandText itself, and an
+	// empty value there means "no typed words", not "the adapter forgot".
+	// Backfilling from Text for those has no legitimate use — a media
+	// message is never a typed command — and actively erases that signal:
+	// Lark's enricher (and any adapter that quotes context into a reply)
+	// writes the quoted/enriched body into Text, not CommandText, precisely
+	// so a wordless reply can be told apart from one that echoes the quoted
+	// text. handlePushReply depends on that distinction to avoid answering
+	// a push with itself when the reply carried no words.
+	if msg.CommandText == "" && msg.Type == channel.MsgTypeText {
 		msg.CommandText = msg.Text
 	}
 
@@ -1114,13 +1125,12 @@ func (r *Router) handlePushReply(ctx context.Context, inst ResolvedInstallation,
 		content = control.Body
 	}
 
-	// One gap remains: a wordless reply (a sticker, an image with no caption)
-	// arrives with CommandText empty and Handle copies Text over it, so the
-	// precondition's empty check sees the quoted push instead of nothing.
-	// Recovering the distinction needs a fourth parameter down dispatch →
-	// processClaimed, and the obvious shortcuts regress adapters whose media
-	// messages carry real captions. Left for the Lark end-to-end task, where
-	// the enrichment this depends on can actually be exercised.
+	// A wordless reply (a sticker, an image with no caption) now arrives with
+	// CommandText genuinely empty: Handle only backfills CommandText from Text
+	// for text messages (see the comment there), so a captionless media reply
+	// is never mistaken for one that echoes the quoted push. content stays ""
+	// and PostPushReplyComment's own precondition denies it as carrying no
+	// words, the same as an empty typed reply would.
 	reply, err := r.pushReplies.PostPushReplyComment(ctx, push, identity.UserID, content)
 	if err != nil {
 		return Result{}, false, fmt.Errorf("post push reply: %w", err)

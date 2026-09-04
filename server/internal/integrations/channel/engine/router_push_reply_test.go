@@ -352,12 +352,19 @@ func TestPushReplyPostsTheSendersOwnWordsNotTheQuotedPush(t *testing.T) {
 	}
 }
 
-// An image-only or sticker reply carries no words, and CommandText arrives
-// empty. Handle backfills it from Text, which on Lark is the quoted push — so
-// the precondition's empty check never fires and the push is answered with
-// itself. This pins the CURRENT behavior, not the wanted one: see the comment
-// in handlePushReply for why the fix is deferred to the Lark end-to-end task.
-func TestPushReplyWithNoTypedWordsFallsBackToEnrichedText(t *testing.T) {
+// An image-only or sticker reply carries no words: the adapter reports
+// msg.Type as non-text and leaves CommandText empty (Lark's decoder sets
+// CommandBody to the same placeholder-flattened body it starts enrichment
+// from — "[Image]"/"[Sticker]" — for the message types this router maps to
+// channel.MsgTypeImage/MsgTypeUnknown, and an unmapped Lark type flattens to
+// "" outright). Handle no longer backfills CommandText from Text for a
+// non-text message (see the comment there), so content reaches
+// PostPushReplyComment empty rather than as the enriched quoted push, and the
+// poster's own empty-content precondition is what denies it — proven
+// separately by TestPostPushReplyCommentRejectsEmptyContent in
+// internal/handler. This used to pin the opposite (buggy) behavior; see the
+// task-8 report for the fix.
+func TestPushReplyWithNoTypedWordsPostsEmptyContent(t *testing.T) {
 	f := &fakePushReplies{
 		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
 		result:      PushReplyResult{Posted: true, Message: "已记录"},
@@ -366,6 +373,7 @@ func TestPushReplyWithNoTypedWordsFallsBackToEnrichedText(t *testing.T) {
 
 	enriched := "<quoted_message>\n**[状态变更] Ship it**\n</quoted_message>"
 	msg := p2pMessage(t)
+	msg.Type = channel.MsgTypeImage
 	msg.Text = enriched
 	msg.CommandText = ""
 	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
@@ -375,8 +383,8 @@ func TestPushReplyWithNoTypedWordsFallsBackToEnrichedText(t *testing.T) {
 	}
 	lastResult(t, h)
 
-	if len(f.posted) != 1 || f.posted[0] != enriched {
-		t.Fatalf("posted = %v; the known gap moved — reassess the deferral", f.posted)
+	if len(f.posted) != 1 || f.posted[0] != "" {
+		t.Fatalf("posted = %v, want a single empty-content post — the gap is back", f.posted)
 	}
 }
 
