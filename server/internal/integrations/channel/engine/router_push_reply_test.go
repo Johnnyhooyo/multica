@@ -267,6 +267,37 @@ func TestPushReplyRefusesARowFromAnotherWorkspace(t *testing.T) {
 	}
 }
 
+// /new and /clear are chat-session controls with no meaning on a path that
+// never touches a session. Telegram hands CommandText over with the directive
+// still attached (inbound.go sets commandText before stripping, so downstream
+// classifiers can see the original source) — so reading CommandText raw would
+// put "/clear 确认审核" into the issue thread as the member's words.
+func TestPushReplyStripsAControlDirective(t *testing.T) {
+	for _, directive := range []string{"/clear", "/new"} {
+		t.Run(directive, func(t *testing.T) {
+			f := &fakePushReplies{
+				byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
+				result:      PushReplyResult{Posted: true, Message: "已记录"},
+			}
+			h := newHarnessWithPushReplies(t, f)
+
+			msg := p2pMessage(t)
+			msg.Text = "确认审核"
+			msg.CommandText = directive + " 确认审核"
+			msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+
+			if err := h.router.Handle(context.Background(), msg); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			lastResult(t, h)
+
+			if len(f.posted) != 1 || f.posted[0] != "确认审核" {
+				t.Fatalf("posted = %v, want the directive stripped", f.posted)
+			}
+		})
+	}
+}
+
 // The feature must be inert until Task 8 wires it: newHarness never sets
 // RouterConfig.PushReplies, so it defaults to nil.
 func TestNilPushRepliesLeavesTheOldPathUntouched(t *testing.T) {

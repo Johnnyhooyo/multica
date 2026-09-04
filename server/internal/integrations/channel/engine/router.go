@@ -1105,18 +1105,23 @@ func (r *Router) handlePushReply(ctx context.Context, inst ResolvedInstallation,
 	// sender's answer stapled underneath. CommandText is the pre-enrichment
 	// body every adapter carries for exactly this reason.
 	//
-	// Handle guarantees CommandText is non-empty by copying Text into it, and a
-	// consumed /new leaves its body behind; a /clear directive survives, which
-	// is cosmetic next to quoting the whole push back into the issue thread.
-	//
-	// That backfill leaves one gap: a wordless reply (a sticker, an image with
-	// no caption) arrives with CommandText empty and gets Text copied over it,
-	// so the precondition's empty check sees the quoted push instead of
-	// nothing. Recovering the distinction here needs a fourth parameter down
-	// dispatch → processClaimed, and the obvious shortcuts regress adapters
-	// whose media messages carry real captions. Left for the Lark end-to-end
-	// task, where the enrichment this depends on can actually be exercised.
-	reply, err := r.pushReplies.PostPushReplyComment(ctx, push, identity.UserID, msg.CommandText)
+	// A control directive still has to come off. Handle strips /new from
+	// CommandText but deliberately leaves /clear there for downstream
+	// classifiers, and Telegram hands it over unstripped either way. Neither
+	// controls anything on a path that never touches a session.
+	content := msg.CommandText
+	if control, ok := ParseControlCommand(content); ok {
+		content = control.Body
+	}
+
+	// One gap remains: a wordless reply (a sticker, an image with no caption)
+	// arrives with CommandText empty and Handle copies Text over it, so the
+	// precondition's empty check sees the quoted push instead of nothing.
+	// Recovering the distinction needs a fourth parameter down dispatch →
+	// processClaimed, and the obvious shortcuts regress adapters whose media
+	// messages carry real captions. Left for the Lark end-to-end task, where
+	// the enrichment this depends on can actually be exercised.
+	reply, err := r.pushReplies.PostPushReplyComment(ctx, push, identity.UserID, content)
 	if err != nil {
 		return Result{}, false, fmt.Errorf("post push reply: %w", err)
 	}
