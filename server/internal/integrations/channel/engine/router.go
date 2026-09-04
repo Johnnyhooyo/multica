@@ -1085,13 +1085,48 @@ func (r *Router) handlePushReply(ctx context.Context, inst ResolvedInstallation,
 		return Result{}, false, nil
 	}
 
-	// msg.Text, not msg.CommandText: a push reply is prose the sender wrote,
-	// never a command to classify, and Handle's /new /clear rewriting only
-	// guarantees CommandText is command-free, not that it still holds every
-	// word the sender typed.
-	reply, err := r.pushReplies.PostPushReplyComment(ctx, push, identity.UserID, msg.Text)
+	// The lookup key is (installation, platform message id) — it says nothing
+	// about the workspace. Everything downstream reads push.WorkspaceID: the
+	// membership check that authorizes the sender, the issue lookup, the comment
+	// write. Two rows written by different code paths at different times have to
+	// agree before any of that runs, or a reply arriving through this
+	// installation could act inside a workspace it does not serve.
+	if push.WorkspaceID != inst.WorkspaceID {
+		return Result{}, false, fmt.Errorf(
+			"push %s belongs to workspace %s, installation %s serves %s",
+			msg.ReplyTo.MessageID, util.UUIDToString(push.WorkspaceID),
+			util.UUIDToString(inst.ID), util.UUIDToString(inst.WorkspaceID))
+	}
+
+	// msg.CommandText, not msg.Text: Text is the agent-readable body, and
+	// adapters are free to enrich it. Lark always does on this path — its
+	// enricher prepends the quoted parent whenever ParentID is set, and a push
+	// reply by construction has ParentID set — so Text is our own push with the
+	// sender's answer stapled underneath. CommandText is the pre-enrichment
+	// body every adapter carries for exactly this reason.
+	//
+	// Handle guarantees CommandText is non-empty by copying Text into it, and a
+	// consumed /new leaves its body behind; a /clear directive survives, which
+	// is cosmetic next to quoting the whole push back into the issue thread.
+	//
+	// That backfill leaves one gap: a wordless reply (a sticker, an image with
+	// no caption) arrives with CommandText empty and gets Text copied over it,
+	// so the precondition's empty check sees the quoted push instead of
+	// nothing. Recovering the distinction here needs a fourth parameter down
+	// dispatch → processClaimed, and the obvious shortcuts regress adapters
+	// whose media messages carry real captions. Left for the Lark end-to-end
+	// task, where the enrichment this depends on can actually be exercised.
+	reply, err := r.pushReplies.PostPushReplyComment(ctx, push, identity.UserID, msg.CommandText)
 	if err != nil {
 		return Result{}, false, fmt.Errorf("post push reply: %w", err)
+	}
+	if reply.Message == "" {
+		// Every branch of PostPushReplyComment sets one, so this is a bug in the
+		// poster, not a runtime condition. It is not an error return: that would
+		// leave Handle failed and the adapter would redeliver a message whose
+		// comment is already written. Log it and let the outcome stand.
+		r.logger.ErrorContext(ctx, "channel router: push reply carried no message",
+			"installation_id", util.UUIDToString(inst.ID), "posted", reply.Posted)
 	}
 	outcome := OutcomePushReplyDenied
 	if reply.Posted {

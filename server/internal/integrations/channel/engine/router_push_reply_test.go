@@ -13,17 +13,21 @@ import (
 )
 
 // fakePushReplies is the PushReplyPoster test double. LookupPush is keyed by
-// the platform message id the caller passes, mirroring the real
-// (installationID, channelMessageID) pair without asserting on installationID
-// itself — the router harness only ever runs one installation.
+// the platform message id the caller passes; lookedUpWith records the
+// installation the router scoped the lookup to, which is the other half of the
+// real (installationID, channelMessageID) key and the isolation boundary
+// between two installations that saw the same platform message id.
 type fakePushReplies struct {
-	byMessageID map[string]db.ChannelPushMessage
-	posted      []string
-	result      PushReplyResult
-	lookupErr   error
+	byMessageID  map[string]db.ChannelPushMessage
+	posted       []string
+	lookedUpWith []pgtype.UUID
+	result       PushReplyResult
+	lookupErr    error
+	postErr      error
 }
 
-func (f *fakePushReplies) LookupPush(_ context.Context, _ pgtype.UUID, id string) (db.ChannelPushMessage, bool, error) {
+func (f *fakePushReplies) LookupPush(_ context.Context, installationID pgtype.UUID, id string) (db.ChannelPushMessage, bool, error) {
+	f.lookedUpWith = append(f.lookedUpWith, installationID)
 	if f.lookupErr != nil {
 		return db.ChannelPushMessage{}, false, f.lookupErr
 	}
@@ -32,8 +36,19 @@ func (f *fakePushReplies) LookupPush(_ context.Context, _ pgtype.UUID, id string
 }
 
 func (f *fakePushReplies) PostPushReplyComment(_ context.Context, _ db.ChannelPushMessage, _ pgtype.UUID, content string) (PushReplyResult, error) {
+	if f.postErr != nil {
+		return PushReplyResult{}, f.postErr
+	}
 	f.posted = append(f.posted, content)
 	return f.result, nil
+}
+
+// pushRow is a ledger row as the notifier would have written it: in the same
+// workspace the harness's installation serves. Tests that care about the
+// workspace boundary override it.
+func pushRow(t *testing.T) db.ChannelPushMessage {
+	t.Helper()
+	return db.ChannelPushMessage{WorkspaceID: activeResolved(t).WorkspaceID}
 }
 
 // newHarnessWithPushReplies rebuilds the router with a PushReplies poster
@@ -83,7 +98,7 @@ func lastResult(t *testing.T, h *harness) Result {
 // The core routing claim: a reply to a push leaves the chat pipeline.
 func TestPushReplyDoesNotTouchTheChatPipeline(t *testing.T) {
 	f := &fakePushReplies{
-		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": {}},
+		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
 		result:      PushReplyResult{Posted: true, Message: "已记录"},
 	}
 	h := newHarnessWithPushReplies(t, f)
@@ -118,7 +133,7 @@ func TestPushReplyDoesNotTouchTheChatPipeline(t *testing.T) {
 // A "/issue Foo" typed as a reply to a push is a decision, not a command.
 func TestPushReplyDoesNotParseIssueCommand(t *testing.T) {
 	f := &fakePushReplies{
-		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": {}},
+		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
 		result:      PushReplyResult{Posted: true, Message: "已记录"},
 	}
 	h := newHarnessWithPushReplies(t, f)
@@ -143,7 +158,7 @@ func TestPushReplyDoesNotParseIssueCommand(t *testing.T) {
 // Slack reports only a thread-level id, so RootID is the fallback key.
 func TestPushReplyFallsBackToRootID(t *testing.T) {
 	f := &fakePushReplies{
-		byMessageID: map[string]db.ChannelPushMessage{"root_1": {}},
+		byMessageID: map[string]db.ChannelPushMessage{"root_1": pushRow(t)},
 		result:      PushReplyResult{Posted: true, Message: "已记录"},
 	}
 	h := newHarnessWithPushReplies(t, f)
@@ -198,7 +213,7 @@ func TestNoReplyToSkipsTheLookup(t *testing.T) {
 // A denial still reaches the user; silence would look like the bot is broken.
 func TestPushReplyDenialRepliesAndWritesNothing(t *testing.T) {
 	f := &fakePushReplies{
-		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": {}},
+		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
 		result:      PushReplyResult{Posted: false, Message: "你没有权限回复这条推送。"},
 	}
 	h := newHarnessWithPushReplies(t, f)
@@ -222,6 +237,36 @@ func TestPushReplyDenialRepliesAndWritesNothing(t *testing.T) {
 	}
 }
 
+// A ledger row names its own workspace, and everything downstream — the
+// membership check, the issue lookup, the comment write — trusts that name. The
+// lookup key is only (installation, message id), so nothing in the query itself
+// proves the row belongs to the workspace this installation serves. If the two
+// ever disagree, the reply must not be acted on.
+func TestPushReplyRefusesARowFromAnotherWorkspace(t *testing.T) {
+	foreign := uuidFromString(t, "77777777-7777-7777-7777-777777777777")
+	f := &fakePushReplies{
+		byMessageID: map[string]db.ChannelPushMessage{
+			"om_push_1": {WorkspaceID: foreign},
+		},
+		result: PushReplyResult{Posted: true, Message: "已记录"},
+	}
+	h := newHarnessWithPushReplies(t, f)
+
+	msg := p2pMessage(t)
+	msg.Text = "确认审核"
+	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+
+	if err := h.router.Handle(context.Background(), msg); err == nil {
+		t.Fatal("Handle returned nil for a push row outside the installation's workspace")
+	}
+	if len(f.posted) != 0 {
+		t.Errorf("posted %v; a cross-workspace row must not reach the comment write", f.posted)
+	}
+	if h.binder.ensureCalls != 0 {
+		t.Error("a cross-workspace row fell through to the chat path")
+	}
+}
+
 // The feature must be inert until Task 8 wires it: newHarness never sets
 // RouterConfig.PushReplies, so it defaults to nil.
 func TestNilPushRepliesLeavesTheOldPathUntouched(t *testing.T) {
@@ -236,5 +281,144 @@ func TestNilPushRepliesLeavesTheOldPathUntouched(t *testing.T) {
 	}
 	if res := lastResult(t, h); res.Outcome == OutcomePushReply {
 		t.Fatal("push path ran with no poster configured")
+	}
+}
+
+// The comment body is the sender's own words, not the platform's rendering of
+// the conversation. Lark's enricher prepends a <quoted_message> block to Text
+// whenever ParentID is set (inbound_enricher.go), and a push reply always has
+// ParentID set — so on the one adapter that closes this loop, Text is the push
+// we ourselves sent with the reply stapled underneath. CommandText is the
+// pre-enrichment body (lark/ws_frame_decoder.go copies it before the enricher
+// runs), and every other adapter populates it the same way.
+//
+// Posting Text would put our own deep link and 「直接回复本条消息即可处理。」
+// into the issue thread as if a human had written them, and hand the woken
+// agent its own push back as new instruction.
+func TestPushReplyPostsTheSendersOwnWordsNotTheQuotedPush(t *testing.T) {
+	f := &fakePushReplies{
+		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
+		result:      PushReplyResult{Posted: true, Message: "已记录"},
+	}
+	h := newHarnessWithPushReplies(t, f)
+
+	msg := p2pMessage(t)
+	msg.Text = "<quoted_message>\n**[状态变更] Ship it**\nhttps://app.example.com/acme/issues/x\n" +
+		"直接回复本条消息即可处理。\n</quoted_message>\n\n确认审核"
+	msg.CommandText = "确认审核"
+	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	lastResult(t, h)
+
+	if len(f.posted) != 1 {
+		t.Fatalf("posted %d comments, want 1", len(f.posted))
+	}
+	if f.posted[0] != "确认审核" {
+		t.Errorf("posted %q, want the sender's own words alone", f.posted[0])
+	}
+}
+
+// An image-only or sticker reply carries no words, and CommandText arrives
+// empty. Handle backfills it from Text, which on Lark is the quoted push — so
+// the precondition's empty check never fires and the push is answered with
+// itself. This pins the CURRENT behavior, not the wanted one: see the comment
+// in handlePushReply for why the fix is deferred to the Lark end-to-end task.
+func TestPushReplyWithNoTypedWordsFallsBackToEnrichedText(t *testing.T) {
+	f := &fakePushReplies{
+		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
+		result:      PushReplyResult{Posted: true, Message: "已记录"},
+	}
+	h := newHarnessWithPushReplies(t, f)
+
+	enriched := "<quoted_message>\n**[状态变更] Ship it**\n</quoted_message>"
+	msg := p2pMessage(t)
+	msg.Text = enriched
+	msg.CommandText = ""
+	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	lastResult(t, h)
+
+	if len(f.posted) != 1 || f.posted[0] != enriched {
+		t.Fatalf("posted = %v; the known gap moved — reassess the deferral", f.posted)
+	}
+}
+
+// The ledger key is (installation, platform message id). Two installations can
+// see the same id, so the router must scope every lookup to the installation it
+// resolved for this message — passing pgtype.UUID{} or some other installation
+// would let a reply in one workspace's IM find another workspace's push.
+func TestPushReplyLooksUpUnderTheResolvedInstallation(t *testing.T) {
+	f := &fakePushReplies{
+		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
+		result:      PushReplyResult{Posted: true, Message: "已记录"},
+	}
+	h := newHarnessWithPushReplies(t, f)
+
+	msg := p2pMessage(t)
+	msg.Text = "确认审核"
+	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+
+	if err := h.router.Handle(context.Background(), msg); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	lastResult(t, h)
+
+	if len(f.lookedUpWith) == 0 {
+		t.Fatal("LookupPush was never called")
+	}
+	want := h.inst.inst.ID
+	for i, got := range f.lookedUpWith {
+		if got != want {
+			t.Errorf("lookup %d scoped to installation %v, want %v", i, got, want)
+		}
+	}
+}
+
+// A database fault is not a verdict. It leaves Handle as a real error so the
+// adapter retries, and the sender is told nothing — answering a fault with any
+// of the product messages would report a decision that was never recorded.
+func TestPushReplyPostFaultIsAnErrorAndSaysNothing(t *testing.T) {
+	f := &fakePushReplies{
+		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
+		postErr:     errors.New("connection reset"),
+	}
+	h := newHarnessWithPushReplies(t, f)
+
+	msg := p2pMessage(t)
+	msg.Text = "确认审核"
+	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+
+	if err := h.router.Handle(context.Background(), msg); err == nil {
+		t.Fatal("Handle returned nil for an infrastructure fault")
+	}
+	if calls := h.replier.calls(); len(calls) != 0 {
+		t.Errorf("replied %v; a fault must not reach the sender", calls)
+	}
+	if h.binder.ensureCalls != 0 {
+		t.Error("a faulted push reply fell through to the chat path")
+	}
+}
+
+// A lookup fault is the same: the reply is neither posted nor answered, and it
+// must not silently become an ordinary chat turn.
+func TestPushReplyLookupFaultDoesNotFallThroughToChat(t *testing.T) {
+	f := &fakePushReplies{lookupErr: errors.New("connection reset")}
+	h := newHarnessWithPushReplies(t, f)
+
+	msg := p2pMessage(t)
+	msg.Text = "确认审核"
+	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+
+	if err := h.router.Handle(context.Background(), msg); err == nil {
+		t.Fatal("Handle returned nil for a lookup fault")
+	}
+	if h.binder.ensureCalls != 0 {
+		t.Error("a failed lookup fell through to the chat path")
 	}
 }

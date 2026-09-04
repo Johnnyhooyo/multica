@@ -179,11 +179,6 @@ func TestReply_CommandOutcomes_PostGuidance(t *testing.T) {
 	}
 }
 
-// TestSendBindingPrompt_GroupNeverLeaksToken drives the REAL sendBindingPrompt
-// group branch — the single line the whole #1 fix rests on. It asserts the
-// token-bearing frame goes only to the sender at chat_type=1, the group gets a
-// token-less acknowledgement, and NO group-addressed frame carries the raw
-// token. Re-pointing sendBindingPrompt at post() (the pre-fix bug) fails this.
 // TestReply_PushReply_PostsPushReplyText covers a hypothetical future WeCom
 // ReplyTo support: engine.Router only reaches these outcomes when
 // InboundMessage.ReplyTo is set, which the WeCom adapter never populates
@@ -203,6 +198,11 @@ func TestReply_PushReply_PostsPushReplyText(t *testing.T) {
 	}
 }
 
+// TestSendBindingPrompt_GroupNeverLeaksToken drives the REAL sendBindingPrompt
+// group branch — the single line the whole #1 fix rests on. It asserts the
+// token-bearing frame goes only to the sender at chat_type=1, the group gets a
+// token-less acknowledgement, and NO group-addressed frame carries the raw
+// token. Re-pointing sendBindingPrompt at post() (the pre-fix bug) fails this.
 func TestSendBindingPrompt_GroupNeverLeaksToken(t *testing.T) {
 	t.Parallel()
 	const rawToken = "SECRET_BEARER_TOKEN_do_not_leak"
