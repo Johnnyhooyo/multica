@@ -1116,21 +1116,33 @@ func (r *Router) handlePushReply(ctx context.Context, inst ResolvedInstallation,
 	// sender's answer stapled underneath. CommandText is the pre-enrichment
 	// body every adapter carries for exactly this reason.
 	//
+	// Only for a text message, though. CommandText is the user's typed words
+	// only when there were words to type: Lark flattens every other kind to a
+	// bracketed placeholder and copies that into CommandText verbatim
+	// (lark/ws_frame_decoder.go), so without this gate an image reply posts
+	// "[Image]" into the issue thread as the member's verdict and wakes the
+	// agent on it. Nothing at this layer can tell a placeholder from a real
+	// caption — Telegram would hand over a genuine photo caption the same way —
+	// so a non-text reply is refused rather than guessed at. Refusing costs a
+	// user one retyped word; guessing writes a decision they did not make.
+	//
 	// A control directive still has to come off. Handle strips /new from
 	// CommandText but deliberately leaves /clear there for downstream
 	// classifiers, and Telegram hands it over unstripped either way. Neither
 	// controls anything on a path that never touches a session.
-	content := msg.CommandText
-	if control, ok := ParseControlCommand(content); ok {
-		content = control.Body
+	content := ""
+	if msg.Type == channel.MsgTypeText {
+		content = msg.CommandText
+		if control, ok := ParseControlCommand(content); ok {
+			content = control.Body
+		}
 	}
 
-	// A wordless reply (a sticker, an image with no caption) now arrives with
-	// CommandText genuinely empty: Handle only backfills CommandText from Text
-	// for text messages (see the comment there), so a captionless media reply
-	// is never mistaken for one that echoes the quoted push. content stays ""
-	// and PostPushReplyComment's own precondition denies it as carrying no
-	// words, the same as an empty typed reply would.
+	// content is empty for a wordless reply, and PostPushReplyComment's own
+	// no-words precondition is what denies it — the same answer an empty typed
+	// reply gets. The denial is deliberately the poster's to make: it owns
+	// every other reason a reply is refused, and its message is what reaches
+	// the sender.
 	reply, err := r.pushReplies.PostPushReplyComment(ctx, push, identity.UserID, content)
 	if err != nil {
 		return Result{}, false, fmt.Errorf("post push reply: %w", err)

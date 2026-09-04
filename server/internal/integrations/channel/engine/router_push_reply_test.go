@@ -352,39 +352,52 @@ func TestPushReplyPostsTheSendersOwnWordsNotTheQuotedPush(t *testing.T) {
 	}
 }
 
-// An image-only or sticker reply carries no words: the adapter reports
-// msg.Type as non-text and leaves CommandText empty (Lark's decoder sets
-// CommandBody to the same placeholder-flattened body it starts enrichment
-// from — "[Image]"/"[Sticker]" — for the message types this router maps to
-// channel.MsgTypeImage/MsgTypeUnknown, and an unmapped Lark type flattens to
-// "" outright). Handle no longer backfills CommandText from Text for a
-// non-text message (see the comment there), so content reaches
-// PostPushReplyComment empty rather than as the enriched quoted push, and the
-// poster's own empty-content precondition is what denies it — proven
+// An image-only or sticker reply carries no words. The router must not treat
+// whatever the adapter put in CommandText as the member's decision: the shape
+// Lark actually sends is a bracketed placeholder, not an empty string
+// (ws_frame_decoder.go copies the flattened body into CommandBody verbatim,
+// and content_flatten.go renders an image as "[Image]"). Posting that would
+// put "[Image]" into the issue thread as a human verdict and wake the agent
+// on it.
+//
+// Both shapes are covered: the placeholder Lark sends, and the empty string a
+// stricter adapter would send. Both must reach PostPushReplyComment with
+// empty content, whose own no-words precondition denies them — proven
 // separately by TestPostPushReplyCommentRejectsEmptyContent in
-// internal/handler. This used to pin the opposite (buggy) behavior; see the
-// task-8 report for the fix.
+// internal/handler.
 func TestPushReplyWithNoTypedWordsPostsEmptyContent(t *testing.T) {
-	f := &fakePushReplies{
-		byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
-		result:      PushReplyResult{Posted: true, Message: "已记录"},
+	cases := []struct {
+		name        string
+		msgType     channel.MsgType
+		commandText string
+	}{
+		{"lark image placeholder", channel.MsgTypeImage, "[Image]"},
+		{"lark sticker placeholder", channel.MsgTypeUnknown, "[Sticker]"},
+		{"adapter sends nothing", channel.MsgTypeImage, ""},
 	}
-	h := newHarnessWithPushReplies(t, f)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakePushReplies{
+				byMessageID: map[string]db.ChannelPushMessage{"om_push_1": pushRow(t)},
+				result:      PushReplyResult{Posted: true, Message: "已记录"},
+			}
+			h := newHarnessWithPushReplies(t, f)
 
-	enriched := "<quoted_message>\n**[状态变更] Ship it**\n</quoted_message>"
-	msg := p2pMessage(t)
-	msg.Type = channel.MsgTypeImage
-	msg.Text = enriched
-	msg.CommandText = ""
-	msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
+			msg := p2pMessage(t)
+			msg.Type = tc.msgType
+			msg.Text = "<quoted_message>\n**[状态变更] Ship it**\n</quoted_message>"
+			msg.CommandText = tc.commandText
+			msg.ReplyTo = &channel.ReplyCtx{MessageID: "om_push_1"}
 
-	if err := h.router.Handle(context.Background(), msg); err != nil {
-		t.Fatalf("Handle: %v", err)
-	}
-	lastResult(t, h)
+			if err := h.router.Handle(context.Background(), msg); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			lastResult(t, h)
 
-	if len(f.posted) != 1 || f.posted[0] != "" {
-		t.Fatalf("posted = %v, want a single empty-content post — the gap is back", f.posted)
+			if len(f.posted) != 1 || f.posted[0] != "" {
+				t.Fatalf("posted = %v, want a single empty-content post — a wordless reply became a decision", f.posted)
+			}
+		})
 	}
 }
 
