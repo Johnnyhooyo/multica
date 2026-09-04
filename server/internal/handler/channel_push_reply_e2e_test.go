@@ -63,7 +63,7 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 
 	// --- push half -------------------------------------------------------
 	fake := &recordingDeliverer{messageID: "om_push_1"}
-	n := notify.New(testHandler.Queries, nil)
+	n := notify.New(testHandler.Queries, nil, nil)
 	n.Register(map[string]notify.DMDeliverer{"feishu": fake})
 
 	n.HandleInboxNew(inboxNewEvent(t, wsID, userID, issueID, "status_changed", "in_review"))
