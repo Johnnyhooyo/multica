@@ -22,7 +22,7 @@
 
 ## 现状:今天怎么做的
 
-用户在与 agent 的 IM 会话里说「确认审核」,agent 自己跑 `multica issue status <id> done`,然后服务端级联。这条路**今天就是通的**,本设计要做的是把它的入口从「主动找 agent」变成「收到推送后原地回复」。
+用户在与 agent 的 IM 会话里回复审核结论,回复会作为普通 issue 评论唤醒 agent。agent 必须结合 issue 当前目标、子任务与阶段门禁判断后续动作:最终验收可以写 `done`;方案/阶段审核通过则可能启动下一批工作并继续保持父 issue 为 `in_progress` 或 `in_review`;修改意见则进入后续处理。这条路**今天就是通的**,本设计要做的是把它的入口从「主动找 agent」变成「收到推送后原地回复」,而不是把「审核通过」硬编码成一次状态迁移。
 
 三点事实,决定了设计形状:
 
@@ -190,7 +190,7 @@ WeCom 两端都不通,且都不是疏忽:
 
 > issue writes park on backlog while comments fire in any status.
 
-于是 agent 带着 issue 上下文醒来,理解「确认审核」,自己写 `done` 并完成收尾;`issue_child_done.go` 的服务端级联随后唤醒父 issue。这就是今天已被验证的完整行为。
+于是 agent 带着 issue 上下文醒来,理解审核回复并决定后续动作。最终验收时可以写 `done` 并完成收尾,再由 `issue_child_done.go` 的服务端级联唤醒父 issue;如果通过的是方案或阶段门禁,则启动下一阶段并按真实进度保留当前状态。这就是今天已被验证的完整行为。回执处理器自身只写评论、触发 agent,不得直接修改 issue 状态。
 
 **接线点**:评论触发机制目前完全在 handler 层(`handler/comment.go` 约 1900 行,全是 `*Handler` 方法),没有 service 层入口,抽一个不在本次范围。复用的办法是既有的口子:`cmd/server/router.go:521` 已经是 `Lifecycle: h`——Handler 自己实现引擎接口。照此加一个窄接口(如 `IssuePushReplyPoster`,单方法),由 `*Handler` 实现、在同一处注入,引擎调它。共享层不碰触发逻辑。
 
@@ -208,6 +208,7 @@ WeCom 两端都不通,且都不是疏忽:
 - 反查命中/未命中/回退 `RootID`/表中无 `issue_id` 四种入站分支。
 - 授权矩阵:发信人非 `recipient_user_id`、未绑定、已绑定非成员、无 issue 访问 —— 全部只回文案不落写。
 - 命中反查行时不创建 chat_session、不解析 `/issue`。
+- 审核回复原文完整落为评论,回执处理器不得直接修改 issue 状态;用「审核通过,继续下一阶段,父任务暂不 done」覆盖非终态审核语义。
 - 评论落地后触发器按既有路径 fire(与 `handler/comment.go` 现有用例同层断言,不重跑其矩阵)。
 - WeCom 迁移后不重复推送;WeCom 的 `Delivered` 带空 MessageID 时**不写**反查行。
 - Lark 全链路:推送 → 带 `ReplyTo` 的回复 → 命中反查 → 落评论 → 触发器 fire。这是回复半程唯一有适配器支撑的端到端路径。

@@ -139,7 +139,7 @@ func TestNotifierDeliversAndRecordsAnInReviewPush(t *testing.T) {
 	for _, want := range []string{
 		"[待你审核] Ship the thing",
 		"任务已进入 in_review，等待你的审核。",
-		"通过请回复「确认审核」；需要修改时，直接回复具体意见。",
+		"审核通过可回复「审核通过」；需要修改请直接说明，Multica 会结合任务上下文继续处理。",
 	} {
 		if !strings.Contains(a.lastTx, want) {
 			t.Errorf("push text %q does not contain %q", a.lastTx, want)

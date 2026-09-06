@@ -19,8 +19,9 @@ import (
 // It is the whole reply half of the IM decision loop. Nothing here advances a
 // status: the comment wakes the issue's agent through the ordinary comment
 // trigger, and the agent decides what the reply meant and does its own
-// follow-on work. That indirection is the point — a hard-coded status write
-// would skip the wrap-up the agent does on approval.
+// follow-on work. That indirection is the point — approval may close a final
+// review, advance the next dependency-gated stage, or authorize other work.
+// A hard-coded status write cannot distinguish those outcomes.
 //
 // Modeled on TaskService.createAgentComment, the other non-HTTP comment path.
 func (h *Handler) PostPushReplyComment(
@@ -106,7 +107,7 @@ func (h *Handler) PostPushReplyComment(
 		"comment_id", uuidToString(comment.ID),
 		"channel_type", push.ChannelType,
 	)
-	return engine.PushReplyResult{Posted: true, Message: "已记录，Multica 正在处理。"}, nil
+	return engine.PushReplyResult{Posted: true, Message: "已记录审核意见，Multica 会结合任务上下文继续处理。"}, nil
 }
 
 // LookupPush finds the push a reply is answering. A miss is not an error:

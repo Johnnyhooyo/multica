@@ -415,7 +415,7 @@ const replyHint = "直接回复本条消息即可处理。"
 const (
 	reviewHandoffLabel = "待你审核"
 	reviewHandoffBody  = "任务已进入 in_review，等待你的审核。"
-	reviewReplyHint    = "通过请回复「确认审核」；需要修改时，直接回复具体意见。"
+	reviewReplyHint    = "审核通过可回复「审核通过」；需要修改请直接说明，Multica 会结合任务上下文继续处理。"
 )
 
 // PlainHead removes the emphasis renderPush wraps the title line in, for

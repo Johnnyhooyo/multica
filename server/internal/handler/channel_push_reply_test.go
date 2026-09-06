@@ -31,12 +31,16 @@ func TestPostPushReplyCommentCreatesAMemberComment(t *testing.T) {
 		IssueID:         parseUUID(issueID),
 	}
 
-	res, err := testHandler.PostPushReplyComment(ctx, push, parseUUID(userID), "确认审核")
+	reply := "审核通过，请继续 Stage 4；父任务暂不设为 done"
+	res, err := testHandler.PostPushReplyComment(ctx, push, parseUUID(userID), reply)
 	if err != nil {
 		t.Fatalf("PostPushReplyComment: %v", err)
 	}
 	if !res.Posted {
 		t.Fatalf("Posted = false, message = %q", res.Message)
+	}
+	if res.Message != "已记录审核意见，Multica 会结合任务上下文继续处理。" {
+		t.Errorf("Message = %q", res.Message)
 	}
 
 	comments := listPushReplyTestComments(t, issueID, wsID)
@@ -52,12 +56,22 @@ func TestPostPushReplyCommentCreatesAMemberComment(t *testing.T) {
 	if uuidToString(comments[0].AuthorID) != userID {
 		t.Errorf("AuthorID = %v, want the replying user", comments[0].AuthorID)
 	}
-	if comments[0].Content != "确认审核" {
-		t.Errorf("Content = %q", comments[0].Content)
+	if comments[0].Content != reply {
+		t.Errorf("Content = %q, want the complete contextual reply %q", comments[0].Content, reply)
 	}
 	// "comment", never a machine type: this is a human speaking.
 	if comments[0].Type != "comment" {
 		t.Errorf("Type = %q, want comment", comments[0].Type)
+	}
+	issue, err := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID:          parseUUID(issueID),
+		WorkspaceID: parseUUID(wsID),
+	})
+	if err != nil {
+		t.Fatalf("GetIssueInWorkspace: %v", err)
+	}
+	if issue.Status != "in_review" {
+		t.Errorf("Status = %q, want in_review: the reply handler must not reduce approval to a direct status transition", issue.Status)
 	}
 }
 

@@ -1081,7 +1081,7 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	if ws, wsErr := n.q.GetWorkspace(ctx, workspaceID); wsErr == nil {
 		slug = ws.Slug
 	}
-	text := renderPush(item, util.UUIDToString(workspaceID), slug, decision.Replyable)
+	text := renderPush(item, util.UUIDToString(workspaceID), slug, effective, decision.Replyable)
 	if text == "" {
 		return
 	}
@@ -1155,10 +1155,12 @@ Note the shape problem this creates: `HandleInboxNew` then calls `FindChannelBin
 
 `channelOrder()` returns the registered adapter keys in a deterministic order — sort them, so two replicas make the same choice for a member bound to two platforms.
 
-`renderPush(item map[string]any, workspaceID, slug string, replyable bool) string` builds the message. Put it in `notifier.go` for now with this behaviour:
+`renderPush(item map[string]any, workspaceID, slug, effectiveStatus string, replyable bool) string` builds the message. Put it in `notifier.go` for now with this behaviour:
 - Returns `""` when both `title` and `type` are empty (nothing worth sending).
 - Renders `**[<label>] <title>**\n<body>\n<deep link>`.
-- When `replyable` is true, appends the Chinese hint line: `直接回复本条消息即可处理。`
+- A `status_changed` push whose effective category is `in_review` renders the action label `待你审核` and the body `任务已进入 in_review，等待你的审核。`; it must not expose the transport label `状态变更`.
+- When that review push is replyable, append `审核通过可回复「审核通过」；需要修改请直接说明，Multica 会结合任务上下文继续处理。` The wording is deliberately context-aware: approval can finish a final review, advance a stage gate, or authorize other follow-on work; it is not a promise of a direct status transition.
+- Other replyable notification types retain the generic hint `直接回复本条消息即可处理。` and their own event-specific label/body.
 - The deep link is `<app base>/<slug or workspace uuid>/issues/<issue_id>`; when there is no `issue_id`, link to the inbox instead.
 
 Do not re-derive the base URL here — find how `wecom/inbox_message.go`'s `inboxItemLink` reads it and use the same source.
@@ -1608,7 +1610,7 @@ git commit -m "feat(lark): deliver inbox pushes as replyable direct messages"
 
 ## Task 6: Inject the reply as an issue comment
 
-This is the load-bearing half. Once a comment lands, nothing new is needed: `triggerTasksForComment` wakes the assignee agent **in any status** (`issue_trigger.go`: "issue writes park on backlog while comments fire in any status"), the agent understands 「确认审核」, writes `done` itself along with its follow-on work, and `issue_child_done.go` cascades to the parent. That whole chain is today's validated behavior — this task only supplies it a new author.
+This is the load-bearing half. Once a comment lands, nothing new is needed: `triggerTasksForComment` wakes the assignee agent **in any status** (`issue_trigger.go`: "issue writes park on backlog while comments fire in any status"). The agent interprets the full reply in issue context: final acceptance may finish with `done`, while approval of a plan or stage gate may start the next dependency-gated work and leave the planning or parent issue in `in_progress` / `in_review`. `issue_child_done.go` cascades only when a child actually reaches its terminal state. This task supplies the reply a new author; it must not collapse every approval into a status transition.
 
 **Why this does not refactor `CreateComment`.** The File Structure originally proposed extracting the create+publish+trigger sequence out of `CreateComment` (`comment.go:1687-1915`) and sharing it. Reading that function, the sequence is not separable: it is threaded with attachment linking, thread-root unresolve, an agent-only escalation cancel, and the `X-Task-ID` lineage stamp. A shared helper would need every one of those as a parameter and would end up a second signature of the same function.
 
@@ -1863,8 +1865,9 @@ import (
 // It is the whole reply half of the IM decision loop. Nothing here advances a
 // status: the comment wakes the issue's agent through the ordinary comment
 // trigger, and the agent decides what the reply meant and does its own
-// follow-on work. That indirection is the point — a hard-coded status write
-// would skip the wrap-up the agent does on approval.
+// follow-on work. That indirection is the point — approval may close a final
+// review, advance the next dependency-gated stage, or authorize other work.
+// A hard-coded status write cannot distinguish those outcomes.
 //
 // Modeled on TaskService.createAgentComment, the other non-HTTP comment path.
 func (h *Handler) PostPushReplyComment(
@@ -1947,7 +1950,7 @@ func (h *Handler) PostPushReplyComment(
 		"comment_id", uuidToString(comment.ID),
 		"channel_type", push.ChannelType,
 	)
-	return engine.PushReplyResult{Posted: true, Message: "已记录，Multica 正在处理。"}, nil
+	return engine.PushReplyResult{Posted: true, Message: "已记录审核意见，Multica 会结合任务上下文继续处理。"}, nil
 }
 ```
 
@@ -2661,4 +2664,3 @@ git commit -m "feat(server): enable IM review pushes and decision replies"
 - A Lark reply to that DM becomes a member comment on the issue and wakes the assignee agent.
 - A WeCom user receives the push and can act on it in the app; replying in WeCom behaves exactly as it did before.
 - Nothing else about inbox behavior changed, except that WeCom users now receive the whitelist instead of every inbox row.
-
