@@ -20,7 +20,7 @@ func TestFitPushKeepsWhatTheRecipientActsOn(t *testing.T) {
 		"body":     strings.Repeat("蒜", 5000),
 	}
 	for _, replyable := range []bool{true, false} {
-		text := renderPush(item, testWorkspace, "acme", replyable)
+		text := renderPush(item, testWorkspace, "acme", "in_review", replyable)
 		link := pushLink(item, testWorkspace, "acme")
 		if link == "" {
 			t.Fatal("pushLink returned empty; the app URL fixture is not taking effect")
@@ -37,8 +37,11 @@ func TestFitPushKeepsWhatTheRecipientActsOn(t *testing.T) {
 		if !strings.Contains(got, link) {
 			t.Errorf("replyable=%v: dropped the deep link", replyable)
 		}
-		if strings.Contains(got, replyHint) != replyable {
+		if strings.Contains(got, reviewReplyHint) != replyable {
 			t.Errorf("replyable=%v: reply hint presence = %v", replyable, !replyable)
+		}
+		if !strings.Contains(got, reviewHandoffLabel) {
+			t.Errorf("replyable=%v: dropped the review action label: %q", replyable, first(got))
 		}
 		if !strings.Contains(got, "…") {
 			t.Errorf("replyable=%v: a truncated push carries no ellipsis", replyable)
@@ -159,7 +162,7 @@ func TestFitPushDoesNotMistakeAMemberURLForTheDeepLink(t *testing.T) {
 		"issue_id": &issueID,
 		"body":     strings.Repeat("蒜", 100) + "\n" + memberURL,
 	}
-	text := renderPush(item, testWorkspace, "acme", true)
+	text := renderPush(item, testWorkspace, "acme", "", true)
 	link := pushLink(item, testWorkspace, "acme")
 
 	const max = 4000

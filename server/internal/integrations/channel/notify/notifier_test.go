@@ -136,6 +136,18 @@ func TestNotifierDeliversAndRecordsAnInReviewPush(t *testing.T) {
 	if a.lastTx == "" {
 		t.Error("delivered empty text")
 	}
+	for _, want := range []string{
+		"[待你审核] Ship the thing",
+		"任务已进入 in_review，等待你的审核。",
+		"通过请回复「确认审核」；需要修改时，直接回复具体意见。",
+	} {
+		if !strings.Contains(a.lastTx, want) {
+			t.Errorf("push text %q does not contain %q", a.lastTx, want)
+		}
+	}
+	if strings.Contains(a.lastTx, "[状态变更]") {
+		t.Errorf("review handoff exposed the transport event instead of the user action: %q", a.lastTx)
+	}
 	if len(q.created) != 1 {
 		t.Fatalf("ledger rows = %d, want 1", len(q.created))
 	}
@@ -163,7 +175,7 @@ func TestNotifierDoesNotPromiseRepliesAPlatformCannotCarry(t *testing.T) {
 	if a.calls != 1 {
 		t.Fatalf("adapter calls = %d, want 1: the push still goes out", a.calls)
 	}
-	if strings.Contains(a.lastTx, replyHint) {
+	if strings.Contains(a.lastTx, replyHint) || strings.Contains(a.lastTx, reviewReplyHint) {
 		t.Errorf("pushed the reply hint to a platform that cannot accept replies: %q", a.lastTx)
 	}
 	if len(q.created) != 0 {
@@ -178,7 +190,7 @@ func TestNotifierPromisesRepliesWhereTheyWork(t *testing.T) {
 	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_r"}}
 	newTestNotifier(t, q, a).HandleInboxNew(inReviewEvent())
 
-	if !strings.Contains(a.lastTx, replyHint) {
+	if !strings.Contains(a.lastTx, reviewReplyHint) {
 		t.Errorf("replyable push carries no reply hint: %q", a.lastTx)
 	}
 }
@@ -268,6 +280,9 @@ func TestNotifierNormalisesACustomStatusToItsCategory(t *testing.T) {
 
 	if a.calls != 1 {
 		t.Errorf("adapter calls = %d, want 1 for a custom status in the in_review category", a.calls)
+	}
+	if !strings.Contains(a.lastTx, "[待你审核]") {
+		t.Errorf("custom in_review-category status did not receive review copy: %q", a.lastTx)
 	}
 }
 

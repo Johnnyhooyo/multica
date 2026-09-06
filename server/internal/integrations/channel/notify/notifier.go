@@ -207,7 +207,7 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	// reply AND the platform can carry one back. WeCom fails the second half,
 	// so its pushes render without the reply hint and rely on the deep link.
 	replyable := decision.Replyable && adapter.AcceptsReplies()
-	text := renderPush(item, util.UUIDToString(workspaceID), slug, replyable)
+	text := renderPush(item, util.UUIDToString(workspaceID), slug, effective, replyable)
 	if text == "" {
 		// renderPush returns "" only when the item has neither a title nor a
 		// type, which the whitelist should already have rejected.
@@ -412,6 +412,12 @@ func pushTypeLabel(t string) string {
 // act on it without leaving IM.
 const replyHint = "直接回复本条消息即可处理。"
 
+const (
+	reviewHandoffLabel = "待你审核"
+	reviewHandoffBody  = "任务已进入 in_review，等待你的审核。"
+	reviewReplyHint    = "通过请回复「确认审核」；需要修改时，直接回复具体意见。"
+)
+
 // PlainHead removes the emphasis renderPush wraps the title line in, for
 // platforms whose message body renders no markdown. Lark's msg_type=text is
 // the case in hand — it shows the asterisks literally
@@ -467,7 +473,7 @@ func FitPush(text string, maxRunes int) string {
 	lines := strings.Split(text, "\n")
 	head, rest := lines[0], lines[1:]
 	var tail []string
-	if len(rest) > 0 && rest[len(rest)-1] == replyHint {
+	if len(rest) > 0 && isPushReplyHint(rest[len(rest)-1]) {
 		tail = append(tail, rest[len(rest)-1])
 		rest = rest[:len(rest)-1]
 	}
@@ -531,6 +537,10 @@ func isBarePushLink(line string) bool {
 	return strings.HasPrefix(line, "https://") && !strings.ContainsAny(line, " \t")
 }
 
+func isPushReplyHint(line string) bool {
+	return line == replyHint || line == reviewReplyHint
+}
+
 // truncateRunes trims s to at most maxRunes runes. Rune-based rather than
 // byte-based so a cut never splits a Chinese character.
 //
@@ -566,7 +576,7 @@ func truncateRunes(s string, maxRunes int) string {
 //	{reply hint, when replyable}
 //
 // Returns "" when both title and type are empty — nothing worth sending.
-func renderPush(item map[string]any, workspaceID, slug string, replyable bool) string {
+func renderPush(item map[string]any, workspaceID, slug, effectiveStatus string, replyable bool) string {
 	title, _ := item["title"].(string)
 	typeStr, _ := item["type"].(string)
 	if title == "" && typeStr == "" {
@@ -574,10 +584,21 @@ func renderPush(item map[string]any, workspaceID, slug string, replyable bool) s
 	}
 	body := pushItemBody(item)
 	link := pushLink(item, workspaceID, slug)
+	label := pushTypeLabel(typeStr)
+	hint := replyHint
+	if typeStr == "status_changed" && effectiveStatus == "in_review" {
+		label = reviewHandoffLabel
+		if body == "" {
+			body = reviewHandoffBody
+		} else {
+			body = reviewHandoffBody + "\n" + body
+		}
+		hint = reviewReplyHint
+	}
 
 	var b strings.Builder
 	b.WriteString("**[")
-	b.WriteString(pushTypeLabel(typeStr))
+	b.WriteString(label)
 	b.WriteString("] ")
 	b.WriteString(title)
 	b.WriteString("**")
@@ -591,7 +612,7 @@ func renderPush(item map[string]any, workspaceID, slug string, replyable bool) s
 	}
 	if replyable {
 		b.WriteString("\n")
-		b.WriteString(replyHint)
+		b.WriteString(hint)
 	}
 	return b.String()
 }
