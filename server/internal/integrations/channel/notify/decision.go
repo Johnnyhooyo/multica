@@ -50,6 +50,10 @@ var pushableTypes = map[string]bool{
 	// there is no issue_id and no comment target.
 	"quick_create_failed":      false,
 	"quick_create_unconfirmed": false,
+
+	// Workspace idle notifications aggregate a whole workflow and therefore
+	// have no single issue where a reply could be injected.
+	"workspace_idle": false,
 }
 
 // Decide applies the push whitelist.

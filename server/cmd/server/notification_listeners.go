@@ -147,6 +147,7 @@ var notifTypeToGroup = map[string]string{
 	"task_failed":        "agent_activity",
 	"agent_blocked":      "agent_activity",
 	"agent_completed":    "agent_activity",
+	"workspace_idle":     "agent_activity",
 }
 
 // isNotifMuted returns true if the given notification type is muted for a user

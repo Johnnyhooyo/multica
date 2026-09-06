@@ -399,6 +399,7 @@ var pushTypeLabels = map[string]string{
 	"task_failed":              "task 失败",
 	"quick_create_failed":      "快速创建失败",
 	"quick_create_unconfirmed": "快速创建待确认",
+	"workspace_idle":           "工作区状态",
 }
 
 func pushTypeLabel(t string) string {

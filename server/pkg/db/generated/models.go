@@ -1541,6 +1541,13 @@ type Workspace struct {
 	AttributionFailClosed bool `json:"attribution_fail_closed"`
 }
 
+type WorkspaceIdleState struct {
+	WorkspaceID            pgtype.UUID        `json:"workspace_id"`
+	BusyGeneration         int64              `json:"busy_generation"`
+	IdleNotifiedGeneration int64              `json:"idle_notified_generation"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
 type WorkspaceInvitation struct {
 	ID            pgtype.UUID        `json:"id"`
 	WorkspaceID   pgtype.UUID        `json:"workspace_id"`

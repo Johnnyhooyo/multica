@@ -34,6 +34,7 @@ func TestDecide(t *testing.T) {
 		// did not happen.
 		{"quick_create_failed pushes but is not replyable", "quick_create_failed", "", Decision{Push: true}},
 		{"quick_create_unconfirmed pushes but is not replyable", "quick_create_unconfirmed", "", Decision{Push: true}},
+		{"workspace_idle pushes but is not replyable", "workspace_idle", "", Decision{Push: true}},
 
 		// Everything else is noise for an IM DM.
 		{"new_comment does not push", "new_comment", "", Decision{}},
@@ -60,7 +61,7 @@ func TestDecideNeverReplyableWithoutPush(t *testing.T) {
 	t.Parallel()
 	types := []string{
 		"status_changed", "task_failed", "quick_create_failed",
-		"quick_create_unconfirmed", "new_comment", "mentioned", "",
+		"quick_create_unconfirmed", "workspace_idle", "new_comment", "mentioned", "",
 	}
 	statuses := []string{"", "backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"}
 	for _, ty := range types {
