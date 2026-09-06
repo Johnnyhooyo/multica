@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** When an inbox notification says "a human is needed now", push it as an IM direct message, and let a reply to that DM become an issue comment that wakes the agent.
+**Goal:** When an inbox notification says "a human is needed now", push it as an IM direct message, and let a reply to that DM record the human decision and wake the agent.
 
-**Architecture:** A new shared package `internal/integrations/channel/notify` subscribes to `protocol.EventInboxNew`, filters through a hardcoded whitelist, looks up the recipient's channel binding, and asks a per-platform adapter to `DeliverDM`. When the adapter returns a platform message id, the push is recorded in a new `channel_push_message` ledger. On the way back, `engine.Router` checks an inbound message's `ReplyTo` against that ledger *before* chat-session resolution; a hit is injected as an issue comment through a new narrow interface implemented by `*handler.Handler`, and the existing comment triggers wake the agent.
+**Architecture:** A new shared package `internal/integrations/channel/notify` subscribes to `protocol.EventInboxNew`, filters through a hardcoded whitelist, looks up the recipient's channel binding, and asks a per-platform adapter to `DeliverDM`. When the adapter returns a platform message id, the push is recorded in a new `channel_push_message` ledger. On the way back, `engine.Router` checks an inbound message's `ReplyTo` against that ledger *before* chat-session resolution; a hit is injected as an issue comment through a new narrow interface implemented by `*handler.Handler`, and the existing comment triggers wake the agent. Exact `审核通过` / `确认审核` replies additionally move an `in_review`-category issue to `done` as the replying member; contextual replies remain comment-only.
 
 **Tech Stack:** Go 1.26, Chi, sqlc (pgx/v5, `pgtype`), `internal/events.Bus`, `internal/testutil` (`dbfx`, `testutil.Call`), PostgreSQL 17.
 
@@ -1159,7 +1159,7 @@ Note the shape problem this creates: `HandleInboxNew` then calls `FindChannelBin
 - Returns `""` when both `title` and `type` are empty (nothing worth sending).
 - Renders `**[<label>] <title>**\n<body>\n<deep link>`.
 - A `status_changed` push whose effective category is `in_review` renders the action label `待你审核` and the body `任务已进入 in_review，等待你的审核。`; it must not expose the transport label `状态变更`.
-- When that review push is replyable, append `审核通过可回复「审核通过」；需要修改请直接说明，Multica 会结合任务上下文继续处理。` The wording is deliberately context-aware: approval can finish a final review, advance a stage gate, or authorize other follow-on work; it is not a promise of a direct status transition.
+- When that review push is replyable, append `审核通过可回复「审核通过」；需要修改请直接说明，Multica 会结合任务上下文继续处理。` An exact approval reply is a direct `done` transition; a reply with additional instructions stays contextual and does not auto-transition.
 - Other replyable notification types retain the generic hint `直接回复本条消息即可处理。` and their own event-specific label/body.
 - The deep link is `<app base>/<slug or workspace uuid>/issues/<issue_id>`; when there is no `issue_id`, link to the inbox instead.
 
@@ -1608,9 +1608,9 @@ git commit -m "feat(lark): deliver inbox pushes as replyable direct messages"
 
 ---
 
-## Task 6: Inject the reply as an issue comment
+## Task 6: Record the reply and explicit review decision
 
-This is the load-bearing half. Once a comment lands, nothing new is needed: `triggerTasksForComment` wakes the assignee agent **in any status** (`issue_trigger.go`: "issue writes park on backlog while comments fire in any status"). The agent interprets the full reply in issue context: final acceptance may finish with `done`, while approval of a plan or stage gate may start the next dependency-gated work and leave the planning or parent issue in `in_progress` / `in_review`. `issue_child_done.go` cascades only when a child actually reaches its terminal state. This task supplies the reply a new author; it must not collapse every approval into a status transition.
+This is the load-bearing half. Every accepted reply becomes a member comment and `triggerTasksForComment` wakes the assignee agent **in any status** (`issue_trigger.go`: "issue writes park on backlog while comments fire in any status"). In addition, an exact `审核通过` or `确认审核` reply against an `in_review`-category task is the replying human's explicit terminal decision: commit the comment and `done` transition together, publish the ordinary member-authored status event, and invoke `notifyParentOfChildDone`. Replies with any additional text remain comment-only so contextual stage instructions are not misread as a terminal decision.
 
 **Why this does not refactor `CreateComment`.** The File Structure originally proposed extracting the create+publish+trigger sequence out of `CreateComment` (`comment.go:1687-1915`) and sharing it. Reading that function, the sequence is not separable: it is threaded with attachment linking, thread-root unresolve, an agent-only escalation cancel, and the `X-Task-ID` lineage stamp. A shared helper would need every one of those as a parameter and would end up a second signature of the same function.
 
@@ -1860,14 +1860,11 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// PostPushReplyComment turns a reply-to-a-push into an issue comment.
+// PostPushReplyComment turns a reply-to-a-push into an issue comment and, for
+// a narrow explicit approval, records the human-owned review decision.
 //
-// It is the whole reply half of the IM decision loop. Nothing here advances a
-// status: the comment wakes the issue's agent through the ordinary comment
-// trigger, and the agent decides what the reply meant and does its own
-// follow-on work. That indirection is the point — approval may close a final
-// review, advance the next dependency-gated stage, or authorize other work.
-// A hard-coded status write cannot distinguish those outcomes.
+// Exact "审核通过" / "确认审核" replies move an in-review issue to done as the
+// replying member. Contextual replies remain comment-only.
 //
 // Modeled on TaskService.createAgentComment, the other non-HTTP comment path.
 func (h *Handler) PostPushReplyComment(
@@ -2662,5 +2659,7 @@ git commit -m "feat(server): enable IM review pushes and decision replies"
 
 - An issue moving to `in_review` (or a custom status in that category) DMs the inbox recipient on Lark or WeCom, if they are bound and not muted.
 - A Lark reply to that DM becomes a member comment on the issue and wakes the assignee agent.
+- An exact `审核通过` or `确认审核` reply moves an `in_review`-category task to `done` as the replying member, including the standard activity, inbox, and parent-child completion side effects.
+- Contextual approval text and requested changes remain comment-only and never auto-transition the task.
 - A WeCom user receives the push and can act on it in the app; replying in WeCom behaves exactly as it did before.
 - Nothing else about inbox behavior changed, except that WeCom users now receive the whitelist instead of every inbox row.

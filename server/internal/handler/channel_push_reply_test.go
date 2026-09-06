@@ -7,9 +7,195 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+func TestIsExplicitReviewApproval(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "review approved", content: "审核通过", want: true},
+		{name: "confirm review", content: "确认审核", want: true},
+		{name: "surrounding whitespace", content: "  \n审核通过\t", want: true},
+		{name: "approval with instructions", content: "审核通过，请继续 Stage 4", want: false},
+		{name: "requested changes", content: "请补充回归测试", want: false},
+		{name: "empty", content: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isExplicitReviewApproval(tt.content); got != tt.want {
+				t.Fatalf("isExplicitReviewApproval(%q) = %v, want %v", tt.content, got, tt.want)
+			}
+		})
+	}
+}
+
+// An unambiguous approval is both durable feedback and the human-owned status
+// decision. The reply stays as a comment, while the in-review issue enters
+// done and emits the ordinary member-authored status event.
+func TestPostPushReplyCommentExplicitApprovalCompletesReview(t *testing.T) {
+	for _, reply := range []string{"审核通过", "确认审核"} {
+		t.Run(reply, func(t *testing.T) {
+			ctx := context.Background()
+			wsID := dbfx.Workspace(t, "Push Reply Approval", "push-reply-approval-"+uuid.NewString())
+			userID := dbfx.User(t, "Push Reply Approver", "push-reply-approval-"+uuid.NewString()+"@multica.ai")
+			dbfx.Member(t, wsID, userID, "member")
+			issueID := dbfx.Issue(t, "Push reply approval", testutil.Cols{
+				"workspace_id": wsID, "status": "in_review",
+			})
+			dbfx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", issueID)
+
+			h := *testHandler
+			h.Bus = events.New()
+			var updated events.Event
+			h.Bus.Subscribe(protocol.EventIssueUpdated, func(event events.Event) {
+				updated = event
+			})
+
+			push := db.ChannelPushMessage{
+				WorkspaceID:     parseUUID(wsID),
+				RecipientUserID: parseUUID(userID),
+				IssueID:         parseUUID(issueID),
+			}
+			res, err := h.PostPushReplyComment(ctx, push, parseUUID(userID), reply)
+			if err != nil {
+				t.Fatalf("PostPushReplyComment: %v", err)
+			}
+			if !res.Posted {
+				t.Fatalf("Posted = false, message = %q", res.Message)
+			}
+
+			comments := listPushReplyTestComments(t, issueID, wsID)
+			if len(comments) != 1 || comments[0].Content != reply {
+				t.Fatalf("comments = %#v, want the original approval reply", comments)
+			}
+			issue, err := h.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+				ID: parseUUID(issueID), WorkspaceID: parseUUID(wsID),
+			})
+			if err != nil {
+				t.Fatalf("GetIssueInWorkspace: %v", err)
+			}
+			if issue.Status != "done" {
+				t.Fatalf("Status = %q, want done", issue.Status)
+			}
+			if updated.Type != protocol.EventIssueUpdated || updated.ActorType != "member" || updated.ActorID != userID {
+				t.Fatalf("updated event = %#v, want member actor %s", updated, userID)
+			}
+			payload, ok := updated.Payload.(map[string]any)
+			if !ok || payload["status_changed"] != true || payload["prev_status"] != "in_review" {
+				t.Fatalf("updated payload = %#v, want in_review -> done", updated.Payload)
+			}
+		})
+	}
+}
+
+func TestPostPushReplyCommentApprovalDoesNotCompleteANonReviewIssue(t *testing.T) {
+	ctx := context.Background()
+	wsID := dbfx.Workspace(t, "Push Reply Non Review", "push-reply-nonreview-"+uuid.NewString())
+	userID := dbfx.User(t, "Push Reply Non Review User", "push-reply-nonreview-"+uuid.NewString()+"@multica.ai")
+	dbfx.Member(t, wsID, userID, "member")
+	issueID := dbfx.Issue(t, "Push reply non-review issue", testutil.Cols{
+		"workspace_id": wsID, "status": "in_progress",
+	})
+	dbfx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", issueID)
+
+	push := db.ChannelPushMessage{
+		WorkspaceID:     parseUUID(wsID),
+		RecipientUserID: parseUUID(userID),
+		IssueID:         parseUUID(issueID),
+	}
+	res, err := testHandler.PostPushReplyComment(ctx, push, parseUUID(userID), "审核通过")
+	if err != nil {
+		t.Fatalf("PostPushReplyComment: %v", err)
+	}
+	if !res.Posted {
+		t.Fatalf("Posted = false, message = %q", res.Message)
+	}
+
+	issue, err := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID: parseUUID(issueID), WorkspaceID: parseUUID(wsID),
+	})
+	if err != nil {
+		t.Fatalf("GetIssueInWorkspace: %v", err)
+	}
+	if issue.Status != "in_progress" {
+		t.Fatalf("Status = %q, want in_progress", issue.Status)
+	}
+	if comments := listPushReplyTestComments(t, issueID, wsID); len(comments) != 1 {
+		t.Fatalf("got %d comments, want 1", len(comments))
+	}
+}
+
+func TestPostPushReplyCommentApprovalCompletesCustomReviewStatus(t *testing.T) {
+	ctx := context.Background()
+	wsID := dbfx.Workspace(t, "Push Reply Custom Review", "push-reply-custom-"+uuid.NewString())
+	userID := dbfx.User(t, "Push Reply Custom Approver", "push-reply-custom-"+uuid.NewString()+"@multica.ai")
+	dbfx.Member(t, wsID, userID, "member")
+	statusKey := "review_" + uuid.NewString()[:8]
+	dbfx.Insert(t, "issue_status", testutil.Cols{
+		"workspace_id": wsID,
+		"key":          statusKey,
+		"name":         "Customer review",
+		"category":     "in_review",
+		"color":        "#123456",
+	})
+	issueID := dbfx.Issue(t, "Push reply custom review", testutil.Cols{
+		"workspace_id": wsID, "status": statusKey,
+	})
+	dbfx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", issueID)
+
+	push := db.ChannelPushMessage{
+		WorkspaceID:     parseUUID(wsID),
+		RecipientUserID: parseUUID(userID),
+		IssueID:         parseUUID(issueID),
+	}
+	if _, err := testHandler.PostPushReplyComment(ctx, push, parseUUID(userID), "审核通过"); err != nil {
+		t.Fatalf("PostPushReplyComment: %v", err)
+	}
+	issue, err := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID: parseUUID(issueID), WorkspaceID: parseUUID(wsID),
+	})
+	if err != nil {
+		t.Fatalf("GetIssueInWorkspace: %v", err)
+	}
+	if issue.Status != "done" {
+		t.Fatalf("Status = %q, want done", issue.Status)
+	}
+}
+
+func TestPostPushReplyCommentApprovalNotifiesAParent(t *testing.T) {
+	ctx := context.Background()
+	fx := newChildDoneFixture(t, "in_progress")
+	if _, err := testHandler.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
+		ID:          parseUUID(fx.child.ID),
+		Status:      "in_review",
+		WorkspaceID: parseUUID(testWorkspaceID),
+	}); err != nil {
+		t.Fatalf("put child in review: %v", err)
+	}
+
+	push := db.ChannelPushMessage{
+		WorkspaceID:     parseUUID(testWorkspaceID),
+		RecipientUserID: parseUUID(testUserID),
+		IssueID:         parseUUID(fx.child.ID),
+	}
+	res, err := testHandler.PostPushReplyComment(ctx, push, parseUUID(testUserID), "审核通过")
+	if err != nil {
+		t.Fatalf("PostPushReplyComment: %v", err)
+	}
+	if !res.Posted {
+		t.Fatalf("Posted = false, message = %q", res.Message)
+	}
+	if got := countSystemCommentsOn(t, fx.parent.ID); got != 1 {
+		t.Fatalf("parent system comments = %d, want 1", got)
+	}
+}
 
 // The happy path: the person the push was addressed to replies, and the reply
 // becomes a member-authored comment on the issue the push was about.

@@ -92,6 +92,15 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 	if !res.Posted {
 		t.Fatalf("Posted = false: %q", res.Message)
 	}
+	approved, err := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID: parseUUID(issueID), WorkspaceID: parseUUID(wsID),
+	})
+	if err != nil {
+		t.Fatalf("GetIssueInWorkspace after approval: %v", err)
+	}
+	if approved.Status != "done" {
+		t.Fatalf("reply status = %q, want done", approved.Status)
+	}
 
 	// --- the wake --------------------------------------------------------
 	// The comment trigger is the mechanism the whole design leans on; assert

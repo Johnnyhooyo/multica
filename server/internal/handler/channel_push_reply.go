@@ -3,25 +3,28 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/issuestatus"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// PostPushReplyComment turns a reply-to-a-push into an issue comment.
+// PostPushReplyComment turns a reply-to-a-push into an issue comment and, for
+// a narrow explicit approval, records the human-owned review decision.
 //
-// It is the whole reply half of the IM decision loop. Nothing here advances a
-// status: the comment wakes the issue's agent through the ordinary comment
-// trigger, and the agent decides what the reply meant and does its own
-// follow-on work. That indirection is the point — approval may close a final
-// review, advance the next dependency-gated stage, or authorize other work.
-// A hard-coded status write cannot distinguish those outcomes.
+// Exact "审核通过" / "确认审核" replies move an in-review issue to done as the
+// replying member. The original comment is still persisted and wakes the
+// issue's agent for any follow-on work. Any reply with additional context is
+// comment-only: the agent must interpret it rather than the platform guessing
+// which part of the workflow the user approved.
 //
 // Modeled on TaskService.createAgentComment, the other non-HTTP comment path.
 func (h *Handler) PostPushReplyComment(
@@ -66,7 +69,7 @@ func (h *Handler) PostPushReplyComment(
 		return engine.PushReplyResult{}, err
 	}
 
-	created, err := h.Queries.CreateComment(ctx, db.CreateCommentParams{
+	createParams := db.CreateCommentParams{
 		ID:          dbid.NewV7(),
 		IssueID:     issue.ID,
 		WorkspaceID: issue.WorkspaceID,
@@ -74,9 +77,50 @@ func (h *Handler) PostPushReplyComment(
 		AuthorID:    senderUserID,
 		Content:     content,
 		Type:        "comment",
-	})
-	if err != nil {
-		return engine.PushReplyResult{}, err
+	}
+
+	var created db.CreateCommentRow
+	var approvedIssue *db.Issue
+	if isExplicitReviewApproval(content) {
+		// Lock the issue and commit the comment plus review decision together.
+		// Without the lock, a stale in_review read could overwrite a concurrent
+		// human transition to another state. Comment-first keeps event revisions
+		// ordered: comment N, then status N+1.
+		tx, txErr := h.TxStarter.Begin(ctx)
+		if txErr != nil {
+			return engine.PushReplyResult{}, fmt.Errorf("begin push reply approval: %w", txErr)
+		}
+		defer tx.Rollback(ctx)
+		qtx := h.Queries.WithTx(tx)
+
+		current, lockErr := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
+			ID: issue.ID, WorkspaceID: issue.WorkspaceID,
+		})
+		if lockErr != nil {
+			return engine.PushReplyResult{}, fmt.Errorf("lock issue for push reply approval: %w", lockErr)
+		}
+		issue = current
+		created, err = qtx.CreateComment(ctx, createParams)
+		if err != nil {
+			return engine.PushReplyResult{}, err
+		}
+		if issuestatus.Effective(ctx, qtx, current.WorkspaceID, current.Status) == issuestatus.InReview {
+			updated, updateErr := qtx.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
+				ID: current.ID, Status: issuestatus.Done, WorkspaceID: current.WorkspaceID,
+			})
+			if updateErr != nil {
+				return engine.PushReplyResult{}, fmt.Errorf("complete approved issue: %w", updateErr)
+			}
+			approvedIssue = &updated
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return engine.PushReplyResult{}, fmt.Errorf("commit push reply approval: %w", commitErr)
+		}
+	} else {
+		created, err = h.Queries.CreateComment(ctx, createParams)
+		if err != nil {
+			return engine.PushReplyResult{}, err
+		}
 	}
 	comment := created.Comment()
 
@@ -101,13 +145,60 @@ func (h *Handler) PostPushReplyComment(
 	// folded into the pending task by mergeCommentIntoPendingTask rather than
 	// starting a second run. Do not add a second guard here.
 	h.triggerTasksForComment(ctx, issue, comment, nil, "member", actorID, actorID, nil)
+	if approvedIssue != nil {
+		h.publishPushReplyApproval(ctx, issue, *approvedIssue, actorID)
+		h.notifyParentOfChildDone(ctx, issue, *approvedIssue)
+	}
 
 	slog.Info("push reply posted as comment",
 		"issue_id", uuidToString(issue.ID),
 		"comment_id", uuidToString(comment.ID),
 		"channel_type", push.ChannelType,
 	)
+	if approvedIssue != nil {
+		return engine.PushReplyResult{Posted: true, Message: "审核已通过，任务已流转为 done，Multica 会继续处理后续工作。"}, nil
+	}
 	return engine.PushReplyResult{Posted: true, Message: "已记录审核意见，Multica 会结合任务上下文继续处理。"}, nil
+}
+
+func isExplicitReviewApproval(content string) bool {
+	switch strings.TrimSpace(content) {
+	case "审核通过", "确认审核":
+		return true
+	default:
+		return false
+	}
+}
+
+// publishPushReplyApproval mirrors the status-change event contract emitted by
+// UpdateIssue. Activity and inbox listeners consume this event, so the IM path
+// gets the same audit and notification side effects as an in-app member edit.
+func (h *Handler) publishPushReplyApproval(ctx context.Context, prev, issue db.Issue, actorID string) {
+	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
+	resp := issueToResponse(issue, prefix)
+	h.fillStatusCategory(ctx, issue.WorkspaceID, &resp)
+	h.publish(protocol.EventIssueUpdated, uuidToString(issue.WorkspaceID), "member", actorID, map[string]any{
+		"issue":               resp,
+		"assignee_changed":    false,
+		"status_changed":      true,
+		"priority_changed":    false,
+		"project_changed":     false,
+		"start_date_changed":  false,
+		"due_date_changed":    false,
+		"description_changed": false,
+		"title_changed":       false,
+		"prev_title":          prev.Title,
+		"prev_assignee_type":  textToPtr(prev.AssigneeType),
+		"prev_assignee_id":    uuidToPtr(prev.AssigneeID),
+		"prev_status":         prev.Status,
+		"prev_priority":       prev.Priority,
+		"prev_start_date":     dateToPtr(prev.StartDate),
+		"prev_due_date":       dateToPtr(prev.DueDate),
+		"prev_description":    textToPtr(prev.Description),
+		"creator_type":        prev.CreatorType,
+		"creator_id":          uuidToString(prev.CreatorID),
+		"source":              "channel_push_reply",
+	})
 }
 
 // LookupPush finds the push a reply is answering. A miss is not an error:
