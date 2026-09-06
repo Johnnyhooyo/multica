@@ -239,6 +239,32 @@ func TestNotifierDoesNotRecordUnreplyableTypes(t *testing.T) {
 	}
 }
 
+func TestNotifierDeliversABlockedStatusWithActionableCopy(t *testing.T) {
+	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_blocked"}}
+	e := inReviewEvent()
+	item := e.Payload.(map[string]any)["item"].(map[string]any)
+	item["issue_status"] = "blocked"
+
+	newTestNotifier(t, q, a).HandleInboxNew(e)
+
+	if a.calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1", a.calls)
+	}
+	for _, want := range []string{
+		"[任务受阻] Ship the thing",
+		"任务已进入 blocked，需要你的反馈或处理。",
+		"请直接回复所需信息或处理意见，Multica 会结合任务上下文继续处理。",
+	} {
+		if !strings.Contains(a.lastTx, want) {
+			t.Errorf("push text %q does not contain %q", a.lastTx, want)
+		}
+	}
+	if len(q.created) != 1 {
+		t.Fatalf("ledger rows = %d, want 1 for a replyable blocked push", len(q.created))
+	}
+}
+
 func TestNotifierSkipsWhatTheWhitelistRejects(t *testing.T) {
 	tests := []struct {
 		name       string

@@ -49,6 +49,24 @@ func TestFitPushKeepsWhatTheRecipientActsOn(t *testing.T) {
 	}
 }
 
+func TestFitPushKeepsBlockedReplyHint(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.example.com")
+	issueID := "33333333-3333-3333-3333-333333333333"
+	item := map[string]any{
+		"type":     "status_changed",
+		"title":    "Blocked task",
+		"issue_id": &issueID,
+		"body":     strings.Repeat("阻", 5000),
+	}
+	got := FitPush(renderPush(item, testWorkspace, "acme", "blocked", true), 4000)
+	if !strings.Contains(got, blockedLabel) {
+		t.Errorf("dropped the blocked action label: %q", first(got))
+	}
+	if !strings.HasSuffix(got, blockedReplyHint) {
+		t.Errorf("blocked reply hint is not preserved at the tail: %q", got)
+	}
+}
+
 // A push already inside the budget must come back byte-identical — no stray
 // ellipsis, no reflowed tail.
 func TestFitPushLeavesAShortPushAlone(t *testing.T) {

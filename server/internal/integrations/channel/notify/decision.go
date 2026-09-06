@@ -23,9 +23,9 @@ type Decision struct {
 // pushableStatusChange lists the effective status categories whose
 // status_changed notification is worth a DM.
 //
-// Only in_review. In Multica's agent flow an agent parks completed work in
-// in_review, so that is the transition that needs a human now — not done,
-// which is the outcome of one. Same product judgement as
+// in_review asks for a decision on completed work. blocked asks for the input
+// or intervention needed to resume work. Both require a human now; routine
+// progress and terminal outcomes do not. Same product judgement as
 // delegatedStatusNotify (cmd/server/notification_listeners.go:89-104), scoped
 // tighter because a DM is more interruptive than an inbox row.
 //
@@ -35,6 +35,7 @@ type Decision struct {
 // which gates before the inbox row exists.
 var pushableStatusChange = map[string]bool{
 	"in_review": true,
+	"blocked":   true,
 }
 
 // pushableTypes lists non-status notification types that always push.

@@ -10,9 +10,9 @@ func TestDecide(t *testing.T) {
 		effectiveStatus string
 		want            Decision
 	}{
-		// in_review is the dominant "this needs you now" transition: an agent
-		// parks completed work there. Mirrors delegatedStatusNotify's reasoning
-		// in cmd/server/notification_listeners.go:89-104.
+		// in_review requests a decision on completed work; blocked requests the
+		// input or intervention needed to resume it. Mirrors
+		// delegatedStatusNotify's reasoning in notification_listeners.go.
 		{"in_review pushes and is replyable", "status_changed", "in_review", Decision{Push: true, Replyable: true}},
 		// A custom status is normalised to its category by the caller, so it
 		// arrives here already reading "in_review".
@@ -21,7 +21,7 @@ func TestDecide(t *testing.T) {
 		{"in_progress does not push", "status_changed", "in_progress", Decision{}},
 		{"backlog does not push", "status_changed", "backlog", Decision{}},
 		{"cancelled does not push", "status_changed", "cancelled", Decision{}},
-		{"blocked does not push", "status_changed", "blocked", Decision{}},
+		{"blocked pushes and is replyable", "status_changed", "blocked", Decision{Push: true, Replyable: true}},
 		{"empty status does not push", "status_changed", "", Decision{}},
 
 		// task_failed carries ReasonAgentBlocked ("Waiting on human input"),

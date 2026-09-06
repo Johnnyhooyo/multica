@@ -65,6 +65,7 @@
 | 收件箱 type | 条件 | 可回复决策 |
 | --- | --- | --- |
 | `status_changed` | `issuestatus.Effective(to) == "in_review"` | 是 |
+| `status_changed` | `issuestatus.Effective(to) == "blocked"` | 是 |
 | `task_failed` | 无(含 `agent_blocked` reason) | 是 |
 | `quick_create_failed` / quick-create 未确认 | 无 | 否,无关联 issue |
 
@@ -202,6 +203,7 @@ WeCom 两端都不通,且都不是疏忽:
 
 - 白名单矩阵:表驱动,放在过滤器旁的 `_test.go`,不经收件箱扇出跑。
 - 自定义状态经 `issuestatus.Effective` 归入 `in_review` 类别时同样推送。
+- 任务进入 `blocked`（包括自定义 blocked 类别）时推送明确的受阻文案，并允许回复所需信息或处理意见。
 - `DeliverResult` 三态各自的指标与降级行为,用 fake 适配器覆盖;`HandedOff` 单独断言不计入送达、且**不写**反查行。
 - 反查命中/未命中/回退 `RootID`/表中无 `issue_id` 四种入站分支。
 - 授权矩阵:发信人非 `recipient_user_id`、未绑定、已绑定非成员、无 issue 访问 —— 全部只回文案不落写。

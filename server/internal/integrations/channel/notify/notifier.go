@@ -416,6 +416,9 @@ const (
 	reviewHandoffLabel = "待你审核"
 	reviewHandoffBody  = "任务已进入 in_review，等待你的审核。"
 	reviewReplyHint    = "审核通过可回复「审核通过」；需要修改请直接说明，Multica 会结合任务上下文继续处理。"
+	blockedLabel       = "任务受阻"
+	blockedBody        = "任务已进入 blocked，需要你的反馈或处理。"
+	blockedReplyHint   = "请直接回复所需信息或处理意见，Multica 会结合任务上下文继续处理。"
 )
 
 // PlainHead removes the emphasis renderPush wraps the title line in, for
@@ -538,7 +541,7 @@ func isBarePushLink(line string) bool {
 }
 
 func isPushReplyHint(line string) bool {
-	return line == replyHint || line == reviewReplyHint
+	return line == replyHint || line == reviewReplyHint || line == blockedReplyHint
 }
 
 // truncateRunes trims s to at most maxRunes runes. Rune-based rather than
@@ -586,14 +589,17 @@ func renderPush(item map[string]any, workspaceID, slug, effectiveStatus string, 
 	link := pushLink(item, workspaceID, slug)
 	label := pushTypeLabel(typeStr)
 	hint := replyHint
-	if typeStr == "status_changed" && effectiveStatus == "in_review" {
-		label = reviewHandoffLabel
-		if body == "" {
-			body = reviewHandoffBody
-		} else {
-			body = reviewHandoffBody + "\n" + body
+	if typeStr == "status_changed" {
+		switch effectiveStatus {
+		case "in_review":
+			label = reviewHandoffLabel
+			body = prependPushBody(reviewHandoffBody, body)
+			hint = reviewReplyHint
+		case "blocked":
+			label = blockedLabel
+			body = prependPushBody(blockedBody, body)
+			hint = blockedReplyHint
 		}
-		hint = reviewReplyHint
 	}
 
 	var b strings.Builder
@@ -615,4 +621,11 @@ func renderPush(item map[string]any, workspaceID, slug, effectiveStatus string, 
 		b.WriteString(hint)
 	}
 	return b.String()
+}
+
+func prependPushBody(prefix, body string) string {
+	if body == "" {
+		return prefix
+	}
+	return prefix + "\n" + body
 }

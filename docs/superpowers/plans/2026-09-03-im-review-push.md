@@ -369,7 +369,7 @@ func TestDecide(t *testing.T) {
 		{"in_progress does not push", "status_changed", "in_progress", Decision{}},
 		{"backlog does not push", "status_changed", "backlog", Decision{}},
 		{"cancelled does not push", "status_changed", "cancelled", Decision{}},
-		{"blocked does not push", "status_changed", "blocked", Decision{}},
+		{"blocked pushes and is replyable", "status_changed", "blocked", Decision{Push: true, Replyable: true}},
 		{"empty status does not push", "status_changed", "", Decision{}},
 
 		// task_failed carries ReasonAgentBlocked ("Waiting on human input"),
@@ -2658,6 +2658,7 @@ git commit -m "feat(server): enable IM review pushes and decision replies"
 ## Done means
 
 - An issue moving to `in_review` (or a custom status in that category) DMs the inbox recipient on Lark or WeCom, if they are bound and not muted.
+- An issue moving to `blocked` (or a custom status in that category) sends a replyable DM with explicit blocked-state guidance.
 - A Lark reply to that DM becomes a member comment on the issue and wakes the assignee agent.
 - An exact `审核通过` or `确认审核` reply moves an `in_review`-category task to `done` as the replying member, including the standard activity, inbox, and parent-child completion side effects.
 - Contextual approval text and requested changes remain comment-only and never auto-transition the task.
