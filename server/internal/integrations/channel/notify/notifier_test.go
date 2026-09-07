@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -160,6 +161,28 @@ func TestNotifierDeliversAndRecordsAnInReviewPush(t *testing.T) {
 	}
 	if util.UUIDToString(got.RecipientUserID) != testRecipient {
 		t.Errorf("ledger RecipientUserID = %q, want %q", util.UUIDToString(got.RecipientUserID), testRecipient)
+	}
+}
+
+func TestNotifierCarriesConfirmationContentAndCommentLink(t *testing.T) {
+	t.Setenv("MULTICA_APP_URL", "https://app.example.com")
+	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_context"}}
+	e := inReviewEvent()
+	item := e.Payload.(map[string]any)["item"].(map[string]any)
+	item["body"] = "请确认方案 A，设计稿：https://docs.example.com/design"
+	item["details"] = json.RawMessage(`{"comment_id":"comment-123"}`)
+
+	newTestNotifier(t, q, a).HandleInboxNew(e)
+
+	for _, want := range []string{
+		"请确认方案 A",
+		"https://docs.example.com/design",
+		"https://app.example.com/acme/issues/" + testIssue + "#comment-comment-123",
+	} {
+		if !strings.Contains(a.lastTx, want) {
+			t.Errorf("push text %q does not contain %q", a.lastTx, want)
+		}
 	}
 }
 

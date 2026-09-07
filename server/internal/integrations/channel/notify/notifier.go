@@ -2,6 +2,7 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/url"
@@ -366,10 +367,42 @@ func pushItemBody(item map[string]any) string {
 	return itemString(item, "body")
 }
 
+// pushItemCommentID extracts the exact comment behind an actionable
+// notification. Production inbox payloads carry details as json.RawMessage;
+// the map forms keep direct callers and tests tolerant of an already-decoded
+// payload.
+func pushItemCommentID(item map[string]any) string {
+	raw, ok := item["details"]
+	if !ok || raw == nil {
+		return ""
+	}
+	var details map[string]string
+	switch value := raw.(type) {
+	case json.RawMessage:
+		if json.Unmarshal(value, &details) != nil {
+			return ""
+		}
+	case []byte:
+		if json.Unmarshal(value, &details) != nil {
+			return ""
+		}
+	case map[string]string:
+		details = value
+	case map[string]any:
+		commentID, _ := value["comment_id"].(string)
+		return commentID
+	default:
+		return ""
+	}
+	return details["comment_id"]
+}
+
 // pushLink builds the deep link: <app base>/<slug or workspace uuid>/issues/<issue_id>
-// when there is an issue to link to, or .../<slug or workspace uuid>/inbox
-// otherwise. Returns "" when no app URL is configured — the caller then
-// drops the whole link segment rather than sending a broken one.
+// when there is an issue to link to, anchored to #comment-<comment_id> when the
+// notification carries its source comment. Issue-less notifications fall back
+// to .../<slug or workspace uuid>/inbox. Returns "" when no app URL is
+// configured — the caller then drops the whole link segment rather than
+// sending a broken one.
 func pushLink(item map[string]any, workspaceID, slug string) string {
 	appURL := pushAppURL()
 	if appURL == "" {
@@ -386,6 +419,10 @@ func pushLink(item map[string]any, workspaceID, slug string) string {
 	if issueID := pushItemIssueID(item); issueID != "" {
 		b.WriteString("/issues/")
 		b.WriteString(url.PathEscape(issueID))
+		if commentID := pushItemCommentID(item); commentID != "" {
+			b.WriteString("#comment-")
+			b.WriteString(url.PathEscape(commentID))
+		}
 	} else {
 		b.WriteString("/inbox")
 	}
