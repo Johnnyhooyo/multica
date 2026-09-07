@@ -503,9 +503,12 @@ multica issue list --full-id
 multica issue list --limit 20 --output json
 multica issue list --status todo --sort position       # board order (the default)
 multica issue list --sort created_at --direction desc  # newest first
+multica issue list --output json --fields=id,title,status,priority  # narrow the JSON payload
 ```
 
 Table output shows a routable issue `KEY` such as `MUL-123`; copy that key into follow-up commands like `issue get`, `issue comment list`, `issue status`, or `--parent`. Add `--full-id` when you need canonical UUIDs. Available filters: `--status`, `--priority`, `--assignee` / `--assignee-id`, `--project`, `--metadata`, `--property`, `--limit`. Use `--assignee-id <uuid>` for unambiguous filtering when names overlap.
+
+`--fields` (JSON output only) whitelists which top-level issue keys come back — pass a comma-separated list such as `--fields=id,title,status,priority`. Omit it for the full issue object, unchanged from before this flag existed. Filtering happens client-side after the CLI fetches the full response, so this shrinks CLI output size and agent context cost — not network transfer or server-side work. Field names are the real API keys, not table-display labels — assignee is `assignee_type`/`assignee_id` rather than a single `assignee` field. An unknown name is rejected up front with the valid list rather than silently dropped. Has no effect on `--output table`.
 
 Results come back in board order (`position`, ascending) by default. Pass `--sort` to change the column (`position`, `title`, `created_at`, `start_date`, `due_date`, `priority`, or `property:<name-or-id>` for a custom property — select properties order by option order, and issues without the property sort last) and `--direction asc|desc` to flip the order. `position` is always ascending (it is the manual drag order), so `--direction` is rejected when `--sort` is `position` or omitted — use it only with `title`, `created_at`, `start_date`, `due_date`, `priority`, or a `property:` sort.
 
@@ -898,6 +901,19 @@ multica autopilot delete <id>
 ```bash
 multica autopilot trigger <id>            # Fires the autopilot once, returns the run
 ```
+
+The command exits non-zero unless the run actually started (`issue_created` or
+`running`). A `skipped` run — admission refused, runtime offline, quota
+exhausted, a duplicate already in flight — dispatched nothing; its
+`failure_reason` and `reason_code` are printed to stderr, and `--output json`
+still writes the full run to stdout first.
+
+Run as an agent (inside a task, or over A2A), the trigger is authorized as the
+human that run acts for, not as the owner of the machine it executes on. That
+human needs exactly the write access they would need to trigger it themselves —
+and it is the only access checked: the machine's owner needs no grant on the
+autopilot, only workspace membership. A run carrying no originator cannot
+trigger at all, and says so rather than failing generically.
 
 ### Run History
 

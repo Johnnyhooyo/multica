@@ -197,8 +197,9 @@ var ErrNoResolverSet = errors.New("channel router: no resolver set for channel t
 // needs-binding, …) are not errors.
 func (r *Router) Handle(ctx context.Context, msg channel.InboundMessage) error {
 	// Preserve the user's original normalized text before any shared command
-	// rewrites. Session binders pass this source to command classifiers while
-	// Text remains the agent-readable body.
+	// rewrites. Session binders pass this source to command classifiers and to
+	// first-title selection (chatTitleSource) while Text remains the
+	// agent-readable body.
 	//
 	// Gated to text messages: every adapter that emits a non-text message
 	// (image, file, audio, video, sticker) sets CommandText itself, and an
@@ -210,6 +211,16 @@ func (r *Router) Handle(ctx context.Context, msg channel.InboundMessage) error {
 	// so a wordless reply can be told apart from one that echoes the quoted
 	// text. handlePushReply depends on that distinction to avoid answering
 	// a push with itself when the reply carried no words.
+	//
+	// INVARIANT: an adapter that enriches Text with content the member did not
+	// type — a quoted reply, recent group history — MUST set CommandText itself
+	// before its message reaches Router. This fallback assigns the ALREADY
+	// enriched Text, so an enriching adapter that leaves CommandText empty
+	// silently reinstates #8058 (the enrichment prefix becomes the Chat title)
+	// while every title test stays green. lark and telegram are today's only
+	// enriching adapters and both comply: lark maps the decoder's
+	// pre-enrichment CommandBody, telegram the cleaned instruction captured
+	// before enrichWithQuotedHumanMessage.
 	if msg.CommandText == "" && msg.Type == channel.MsgTypeText {
 		msg.CommandText = msg.Text
 	}
@@ -693,7 +704,7 @@ func (r *Router) processClaimed(ctx context.Context, set ResolverSet, msg channe
 		if !startChat && !appendRes.BecameVisible {
 			r.lifecycle.ChannelChatTitleInitialized(inst.WorkspaceID, sessionCreator, sessionID, appendRes.InitialTitle)
 		}
-		r.lifecycle.GenerateChannelChatTitle(inst.WorkspaceID, sessionCreator, sessionID, appendRes.InitialTitle, msg.Text)
+		r.lifecycle.GenerateChannelChatTitle(inst.WorkspaceID, sessionCreator, sessionID, appendRes.InitialTitle, chatTitleSource(msg.Text, msg.CommandText, !startChat && msg.ForceFresh))
 	}
 	return res, postAppendFinalize, nil
 }

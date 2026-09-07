@@ -2171,6 +2171,68 @@ func (h *Handler) GetAutopilotRun(w http.ResponseWriter, r *http.Request) {
 
 // ── Manual trigger ──────────────────────────────────────────────────────────
 
+// Machine-readable codes for the two ways a manual trigger can be refused. The
+// CLI keys its actionable output on these rather than on the English sentence,
+// which is what lets a refusal survive translation and copy edits.
+const (
+	autopilotTriggerNoOriginatorCode = "autopilot_trigger_no_originator"
+	autopilotTriggerForbiddenCode    = "autopilot_trigger_forbidden"
+)
+
+// requireAutopilotTriggerInvoker resolves the human whose authority a manual
+// "run now" spends and enforces that they may spend it. It is this endpoint's
+// ONLY write gate — requireAutopilotWrite is deliberately not called alongside
+// it. On refusal it writes 403 and returns false; the caller must return early.
+//
+// A member acts for themselves. An agent — the CLI running inside a task, or an
+// A2A call — acts for its run's ORIGINATOR, the top-of-chain human. That is how
+// every other invoke surface in the codebase judges an agent actor (MUL-3963 /
+// canInvokeAgent), including this file's own private-leader gate on save.
+//
+// Judging the request's authenticated user instead resolves the RUNTIME OWNER
+// under a task token (middleware/auth.go stamps the token's bound user), which
+// is wrong in both directions. Too broad: it makes every agent a standing proxy
+// for its machine's owner, so anyone who can talk to the agent inherits that
+// owner's autopilot rights. Too narrow: keeping it as an ADDITIONAL condition
+// would refuse a member who may trigger this autopilot themselves merely because
+// the agent they asked happens to run on a third party's machine — the run would
+// then need two unrelated humans to hold the same grant, which is not what "act
+// for the ordering human" means and not what was decided for #8078. Workspace
+// tenancy for the authenticated caller is already enforced by the router's
+// RequireWorkspaceMember middleware, so dropping the second check loses no
+// isolation.
+//
+// No resolvable human → refuse. The alternative considered was the workspace-broad
+// exception invokeAgentDecision grants unattributed agent/system principals on a
+// public_to-workspace agent, which would have admitted an originator-less chain
+// here too. Rejected (Bohan's ruling on #8078): a manual trigger is by definition
+// somebody's decision, and a chain reaching this gate with no human at its top
+// means something upstream dropped it — that should surface, not be papered over.
+func (h *Handler) requireAutopilotTriggerInvoker(w http.ResponseWriter, r *http.Request, ap db.Autopilot, workspaceID, actorType, actorID string) (pgtype.UUID, bool) {
+	invoker := h.invokeOriginatorFromRequest(r, actorType, actorID)
+	invokerUserID, err := util.ParseUUID(invoker)
+	if invoker == "" || err != nil {
+		// Distinct from the permission refusal below: nothing was denied, there
+		// was simply nobody to judge. It carries its own code because it is the
+		// one refusal here a workspace can act on, and because the
+		// operator-visible half of #8078 was a message describing a trigger row
+		// that a manual run never has.
+		writeErrorCode(w, http.StatusForbidden, autopilotTriggerNoOriginatorCode,
+			"no human authorized this trigger: the calling run records no originator")
+		return pgtype.UUID{}, false
+	}
+	member, err := h.getWorkspaceMember(r.Context(), invoker, workspaceID)
+	if err != nil || !h.memberCanWriteAutopilot(r.Context(), ap, member) {
+		// Deliberately the same sentence and code whether the ordering human is
+		// a non-member or simply lacks the grant: a caller must not be able to
+		// probe workspace membership through this endpoint.
+		writeErrorCode(w, http.StatusForbidden, autopilotTriggerForbiddenCode,
+			"only the autopilot creator, a workspace admin, or a granted collaborator can trigger this autopilot")
+		return pgtype.UUID{}, false
+	}
+	return invokerUserID, true
+}
+
 func (h *Handler) TriggerAutopilot(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	workspaceID := h.resolveWorkspaceID(r)
@@ -2179,25 +2241,25 @@ func (h *Handler) TriggerAutopilot(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !h.requireAutopilotWrite(w, r, autopilot, workspaceID) {
+	// A manual "run now" is a direct human action, so the run is attributed
+	// direct_human to the human who authorized it (MUL-4302 §4). Resolve the actor
+	// the same way assign/promote does, then resolve the human that actor acts FOR
+	// — see requireAutopilotTriggerInvoker, which is this endpoint's only write
+	// gate. Authorization runs before the status check so an unauthorized caller
+	// cannot tell an inactive autopilot from an active one.
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	invokerUserID, ok := h.requireAutopilotTriggerInvoker(w, r, autopilot, workspaceID, actorType, actorID)
+	if !ok {
 		return
 	}
 	if autopilot.Status != "active" {
 		writeError(w, http.StatusBadRequest, "autopilot is not active")
 		return
 	}
-
-	// A manual "run now" is a direct human action, so the run is attributed
-	// direct_human to the triggering member (MUL-4302 §4). Resolve the actor the
-	// same way assign/promote does; only a member actor is a human — an agent
-	// triggering via A2A yields an invalid actor, which then follows the automation
-	// path: the firing trigger's creator, or nobody when this entry point supplies
-	// no trigger, in which case the run carries no authorization (MUL-6951).
-	userID, ok := requireUserID(w, r)
-	if !ok {
-		return
-	}
-	actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if len(idempotencyKey) > 255 {
@@ -2207,7 +2269,7 @@ func (h *Handler) TriggerAutopilot(w http.ResponseWriter, r *http.Request) {
 	if idempotencyKey == "" {
 		idempotencyKey = service.NewRequestIdempotencyKey()
 	}
-	run, reasonCode, err := h.AutopilotService.DispatchAutopilotManualWithKey(r.Context(), autopilot, pgtype.UUID{}, nil, memberActorUserID(actorType, actorID), idempotencyKey)
+	run, reasonCode, err := h.AutopilotService.DispatchAutopilotManualWithKey(r.Context(), autopilot, pgtype.UUID{}, nil, invokerUserID, idempotencyKey)
 	if err != nil {
 		var quotaErr *service.AutopilotQuotaExceededError
 		if errors.As(err, &quotaErr) {
