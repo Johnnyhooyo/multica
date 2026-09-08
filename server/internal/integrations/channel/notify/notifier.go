@@ -221,6 +221,9 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	ref := PushRef{
 		InboxItemID:     util.UUIDToString(inboxItemID),
 		RecipientUserID: util.UUIDToString(recipientID),
+		WebURL:          pushLink(item, util.UUIDToString(workspaceID), slug),
+		DesktopURL:      pushDesktopLink(item, util.UUIDToString(workspaceID)),
+		StartTopic:      replyable && pushItemIssueID(item) != "",
 	}
 	res, err := adapter.DeliverDM(ctx, ref, binding, text)
 	if err != nil {
@@ -427,6 +430,25 @@ func pushLink(item map[string]any, workspaceID, slug string) string {
 		b.WriteString("/inbox")
 	}
 	return b.String()
+}
+
+// pushDesktopLink builds the stable installed-app destination carried by
+// Lark's PC-specific card URL. UUIDs, rather than the mutable workspace slug,
+// cross the external boundary; Desktop resolves the current slug after login.
+// The source comment is optional because older/non-agent notifications do not
+// always have one, but when present it lets the issue view land on the exact
+// delivery or question the member was asked to review.
+func pushDesktopLink(item map[string]any, workspaceID string) string {
+	issueID := pushItemIssueID(item)
+	if issueID == "" || workspaceID == "" {
+		return ""
+	}
+	query := url.Values{}
+	query.Set("workspace", workspaceID)
+	if commentID := pushItemCommentID(item); commentID != "" {
+		query.Set("comment", commentID)
+	}
+	return "multica://issue/" + url.PathEscape(issueID) + "?" + query.Encode()
 }
 
 // pushTypeLabel is the Chinese display label used in the pushed message's

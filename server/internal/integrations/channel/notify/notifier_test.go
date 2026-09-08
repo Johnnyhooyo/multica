@@ -75,12 +75,14 @@ type fakeAdapter struct {
 	err       error
 	noReplies bool
 	calls     int
+	lastRef   PushRef
 	lastTo    db.ChannelUserBinding
 	lastTx    string
 }
 
-func (a *fakeAdapter) DeliverDM(_ context.Context, _ PushRef, binding db.ChannelUserBinding, text string) (DeliverResult, error) {
+func (a *fakeAdapter) DeliverDM(_ context.Context, ref PushRef, binding db.ChannelUserBinding, text string) (DeliverResult, error) {
 	a.calls++
+	a.lastRef = ref
 	a.lastTo = binding
 	a.lastTx = text
 	return a.result, a.err
@@ -171,18 +173,29 @@ func TestNotifierCarriesConfirmationContentAndCommentLink(t *testing.T) {
 	e := inReviewEvent()
 	item := e.Payload.(map[string]any)["item"].(map[string]any)
 	item["body"] = "请确认方案 A，设计稿：https://docs.example.com/design"
-	item["details"] = json.RawMessage(`{"comment_id":"comment-123"}`)
+	const commentID = "66666666-6666-6666-6666-666666666666"
+	item["details"] = json.RawMessage(`{"comment_id":"` + commentID + `"}`)
 
 	newTestNotifier(t, q, a).HandleInboxNew(e)
 
 	for _, want := range []string{
 		"请确认方案 A",
 		"https://docs.example.com/design",
-		"https://app.example.com/acme/issues/" + testIssue + "#comment-comment-123",
+		"https://app.example.com/acme/issues/" + testIssue + "#comment-" + commentID,
 	} {
 		if !strings.Contains(a.lastTx, want) {
 			t.Errorf("push text %q does not contain %q", a.lastTx, want)
 		}
+	}
+	if a.lastRef.WebURL != "https://app.example.com/acme/issues/"+testIssue+"#comment-"+commentID {
+		t.Errorf("WebURL = %q", a.lastRef.WebURL)
+	}
+	wantDesktop := "multica://issue/" + testIssue + "?comment=" + commentID + "&workspace=" + testWorkspace
+	if a.lastRef.DesktopURL != wantDesktop {
+		t.Errorf("DesktopURL = %q, want %q", a.lastRef.DesktopURL, wantDesktop)
+	}
+	if !a.lastRef.StartTopic {
+		t.Error("StartTopic = false, want true for a replyable Issue push")
 	}
 }
 
@@ -200,6 +213,9 @@ func TestNotifierDoesNotPromiseRepliesAPlatformCannotCarry(t *testing.T) {
 	}
 	if strings.Contains(a.lastTx, replyHint) || strings.Contains(a.lastTx, reviewReplyHint) {
 		t.Errorf("pushed the reply hint to a platform that cannot accept replies: %q", a.lastTx)
+	}
+	if a.lastRef.StartTopic {
+		t.Error("StartTopic = true for a platform that cannot accept replies")
 	}
 	if len(q.created) != 0 {
 		t.Errorf("ledger rows = %d, want 0", len(q.created))

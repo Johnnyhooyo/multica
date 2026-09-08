@@ -377,7 +377,7 @@ func (c *httpAPIClient) SendInteractiveCard(ctx context.Context, p SendCardParam
 // content envelope Lark expects is a JSON-encoded `{"text": "..."}`
 // blob; we encode it here so callers pass raw text.
 func (c *httpAPIClient) SendTextMessage(ctx context.Context, p SendTextParams) (string, error) {
-	if p.ChatID == "" {
+	if p.ChatID == "" && !p.ReplyTarget.IsSet() {
 		return "", errors.New("lark http client: missing chat_id")
 	}
 	if p.Text == "" {
@@ -410,31 +410,35 @@ func (c *httpAPIClient) SendTextMessage(ctx context.Context, p SendTextParams) (
 	return resp.Data.MessageID, nil
 }
 
-// SendDirectMessage posts a plain text IM message straight to a user's
-// open_id, bypassing the chat-level send path entirely: it always sets
-// receive_id_type=open_id (outboundMessageRequest hard-codes chat_id and
-// has no reply-thread need here — an inbox push is a fresh 1:1, never a
-// threaded reply). Returns the message_id so the caller can attribute a
-// later reply back to the push that started it.
+// SendDirectMessage posts a text message or interactive card straight to a
+// user's open_id. It always sets receive_id_type=open_id because an inbox
+// push starts a fresh 1:1 conversation root. Returns the message_id so the
+// caller can attribute a later reply back to the push that started it.
 func (c *httpAPIClient) SendDirectMessage(ctx context.Context, p SendDirectParams) (string, error) {
 	if p.OpenID == "" {
 		return "", errors.New("lark http client: missing open_id")
 	}
-	if p.Text == "" {
-		return "", errors.New("lark http client: missing text")
+	if (p.Text == "") == (p.CardJSON == "") {
+		return "", errors.New("lark http client: exactly one of text or card json is required")
 	}
-	// Same content envelope as SendTextMessage: content = JSON-encoded
-	// {"text": "..."}.
-	contentBytes, err := json.Marshal(map[string]string{"text": p.Text})
-	if err != nil {
-		return "", fmt.Errorf("lark http client: encode text content: %w", err)
+	msgType := "interactive"
+	content := p.CardJSON
+	if p.Text != "" {
+		msgType = "text"
+		// Same content envelope as SendTextMessage: content = JSON-encoded
+		// {"text": "..."}.
+		contentBytes, err := json.Marshal(map[string]string{"text": p.Text})
+		if err != nil {
+			return "", fmt.Errorf("lark http client: encode text content: %w", err)
+		}
+		content = string(contentBytes)
 	}
 	q := url.Values{}
 	q.Set("receive_id_type", "open_id")
 	body := map[string]string{
 		"receive_id": string(p.OpenID),
-		"msg_type":   "text",
-		"content":    string(contentBytes),
+		"msg_type":   msgType,
+		"content":    content,
 	}
 	var resp struct {
 		Code int    `json:"code"`

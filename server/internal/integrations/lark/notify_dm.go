@@ -2,8 +2,11 @@ package lark
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -35,7 +38,7 @@ func NewDMDeliverer(client APIClient, creds CredentialsFunc, logger *slog.Logger
 	return &dmDeliverer{client: client, creds: creds, logger: logger}
 }
 
-func (d *dmDeliverer) DeliverDM(ctx context.Context, _ notify.PushRef, binding db.ChannelUserBinding, text string) (notify.DeliverResult, error) {
+func (d *dmDeliverer) DeliverDM(ctx context.Context, ref notify.PushRef, binding db.ChannelUserBinding, text string) (notify.DeliverResult, error) {
 	if text == "" || binding.ChannelUserID == "" {
 		return notify.DeliverResult{}, nil
 	}
@@ -43,16 +46,21 @@ func (d *dmDeliverer) DeliverDM(ctx context.Context, _ notify.PushRef, binding d
 	if err != nil {
 		return notify.DeliverResult{}, err
 	}
-	messageID, err := d.client.SendDirectMessage(ctx, SendDirectParams{
+	params := SendDirectParams{
 		InstallationID: creds,
 		OpenID:         OpenID(binding.ChannelUserID),
-		// PlainHead, because SendDirectMessage posts msg_type=text and Lark
-		// renders no markdown there — the title's "**" would reach the
-		// recipient as two literal asterisks on every push. A markdown card
-		// would render it, but cards address a chat_id, and this path
-		// deliberately opens a fresh 1:1 by open_id.
-		Text: notify.PlainHead(text),
-	})
+	}
+	plainText := notify.PlainHead(text)
+	if ref.DesktopURL != "" {
+		cardJSON, cardErr := issuePushCard(plainText, ref.WebURL, ref.DesktopURL)
+		if cardErr != nil {
+			return notify.DeliverResult{}, cardErr
+		}
+		params.CardJSON = cardJSON
+	} else {
+		params.Text = plainText
+	}
+	messageID, err := d.client.SendDirectMessage(ctx, params)
 	if err != nil {
 		return notify.DeliverResult{}, err
 	}
@@ -62,7 +70,79 @@ func (d *dmDeliverer) DeliverDM(ctx context.Context, _ notify.PushRef, binding d
 		// Surfacing this as a failure keeps the metric honest.
 		return notify.DeliverResult{}, errors.New("lark: send returned no message_id")
 	}
+	if ref.StartTopic {
+		if _, topicErr := d.client.SendTextMessage(ctx, SendTextParams{
+			InstallationID: creds,
+			Text:           "请在本话题中回复处理意见。",
+			ReplyTarget:    ReplyTarget{MessageID: messageID, InThread: true},
+		}); topicErr != nil {
+			// The root push is already visible and its message id is required for
+			// inbound attribution. Treat topic creation as a graceful degradation
+			// rather than returning an error that would leave the root untracked.
+			d.logger.Warn("lark: create push topic", "message_id", messageID, "err", topicErr)
+		}
+	}
 	return notify.DeliverResult{State: notify.StateDelivered, MessageID: messageID}, nil
+}
+
+func issuePushCard(text, webURL, desktopURL string) (string, error) {
+	defaultURL := webURL
+	if defaultURL == "" {
+		defaultURL = desktopURL
+	}
+	doc := map[string]any{
+		"schema": "2.0",
+		"body": map[string]any{
+			"elements": []any{
+				map[string]any{
+					"tag":     "markdown",
+					"content": escapeCardMarkdown(text),
+				},
+				map[string]any{
+					"tag":  "button",
+					"type": "primary",
+					"text": map[string]any{
+						"tag":     "plain_text",
+						"content": "在 Multica 中查看",
+					},
+					"behaviors": []any{
+						map[string]any{
+							"type":        "open_url",
+							"default_url": defaultURL,
+							"pc_url":      desktopURL,
+						},
+					},
+				},
+			},
+		},
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("lark: encode issue push card: %w", err)
+	}
+	return string(raw), nil
+}
+
+// escapeCardMarkdown preserves the push as literal text inside Lark's
+// schema-2.0 markdown element. The shared renderer may contain user-authored
+// content, so allowing its markdown tokens through would let a task reshape
+// the notification card around the trusted action button.
+func escapeCardMarkdown(text string) string {
+	replacer := strings.NewReplacer(
+		"\\", "\\\\",
+		"`", "\\`",
+		"*", "\\*",
+		"_", "\\_",
+		"~", "\\~",
+		"#", "\\#",
+		"[", "\\[",
+		"]", "\\]",
+		"(", "\\(",
+		")", "\\)",
+		"<", "\\<",
+		">", "\\>",
+	)
+	return replacer.Replace(text)
 }
 
 // AcceptsReplies is true for Lark: SendDirectMessage returns a real

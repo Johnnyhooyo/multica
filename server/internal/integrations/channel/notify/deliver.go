@@ -58,6 +58,16 @@ type DeliverResult struct {
 type PushRef struct {
 	InboxItemID     string
 	RecipientUserID string
+	// WebURL is the ordinary HTTPS fallback for opening the notification's
+	// resource. DesktopURL is the installed-app target for platforms that can
+	// choose a PC-specific URL (Lark cards do). Empty values mean the inbox
+	// item has no issue resource to open.
+	WebURL     string
+	DesktopURL string
+	// StartTopic asks a capable adapter to make this push the root of a
+	// dedicated discussion topic. It is set only for replyable issue pushes;
+	// informational notifications stay as ordinary messages.
+	StartTopic bool
 }
 
 // DMDeliverer sends one direct message to a bound member.

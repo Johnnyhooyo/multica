@@ -6,6 +6,27 @@ import (
 	"unicode/utf8"
 )
 
+func TestPushDesktopLink(t *testing.T) {
+	const commentID = "66666666-6666-6666-6666-666666666666"
+	item := map[string]any{
+		"issue_id": testIssue,
+		"details":  map[string]any{"comment_id": commentID},
+	}
+	want := "multica://issue/" + testIssue + "?comment=" + commentID + "&workspace=" + testWorkspace
+	if got := pushDesktopLink(item, testWorkspace); got != want {
+		t.Errorf("pushDesktopLink() = %q, want %q", got, want)
+	}
+
+	delete(item, "details")
+	want = "multica://issue/" + testIssue + "?workspace=" + testWorkspace
+	if got := pushDesktopLink(item, testWorkspace); got != want {
+		t.Errorf("pushDesktopLink() without comment = %q, want %q", got, want)
+	}
+	if got := pushDesktopLink(map[string]any{}, testWorkspace); got != "" {
+		t.Errorf("pushDesktopLink() without issue = %q, want empty", got)
+	}
+}
+
 // FitPush and renderPush are two halves of one format: this reads the real
 // renderer's output back and asserts the parts the recipient acts on survive a
 // body long enough to blow any platform's budget. A plain tail cut passes a

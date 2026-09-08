@@ -45,8 +45,8 @@ type APIClient interface {
 	// chrome the user doesn't want.
 	SendTextMessage(ctx context.Context, p SendTextParams) (string, error)
 
-	// SendDirectMessage posts plain text straight to a user's open_id and
-	// returns Lark's message_id.
+	// SendDirectMessage posts text or an interactive card straight to a
+	// user's open_id and returns Lark's message_id.
 	//
 	// Distinct from SendTextMessage, which addresses a chat_id
 	// (outboundMessageRequest sets receive_id_type=chat_id). An inbox push
@@ -313,6 +313,9 @@ type SendDirectParams struct {
 	InstallationID InstallationCredentials
 	OpenID         OpenID
 	Text           string
+	// CardJSON is an alternative to Text for a Lark interactive card. Exactly
+	// one of Text and CardJSON must be set.
+	CardJSON string
 }
 
 // SendMarkdownCardParams is the input shape for posting an agent

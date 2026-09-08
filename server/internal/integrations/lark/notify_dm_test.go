@@ -2,6 +2,7 @@ package lark
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -17,13 +18,21 @@ type recordingDMClient struct {
 	APIClient // embedded so only the method under test needs implementing
 	lastOpen  OpenID
 	lastText  string
+	lastCard  string
+	textSends []SendTextParams
 	messageID string
 	err       error
+	topicErr  error
 }
 
 func (c *recordingDMClient) SendDirectMessage(_ context.Context, p SendDirectParams) (string, error) {
-	c.lastOpen, c.lastText = p.OpenID, p.Text
+	c.lastOpen, c.lastText, c.lastCard = p.OpenID, p.Text, p.CardJSON
 	return c.messageID, c.err
+}
+
+func (c *recordingDMClient) SendTextMessage(_ context.Context, p SendTextParams) (string, error) {
+	c.textSends = append(c.textSends, p)
+	return "om_topic", c.topicErr
 }
 
 // testDMCreds stands in for the real credentials lookup NewDMDeliverer takes
@@ -82,6 +91,79 @@ func TestDeliverDMSendsNoLiteralMarkdownToLark(t *testing.T) {
 	// route into the app.
 	if !strings.Contains(c.lastText, "https://app.example.com/acme/issues/x") {
 		t.Errorf("sent %q, want the deep link preserved", c.lastText)
+	}
+}
+
+func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
+	c := &recordingDMClient{messageID: "om_root"}
+	d := NewDMDeliverer(c, testDMCreds, slog.Default())
+	ref := notify.PushRef{
+		WebURL:     "https://app.example.com/acme/issues/issue-id#comment-comment-id",
+		DesktopURL: "multica://issue/issue-id?workspace=workspace-id&comment=comment-id",
+		StartTopic: true,
+	}
+
+	res, err := d.DeliverDM(context.Background(), ref,
+		db.ChannelUserBinding{ChannelUserID: "ou_recipient"},
+		"**[待你审核] Ship *this***\n正文 [link](https://example.com)")
+	if err != nil {
+		t.Fatalf("DeliverDM: %v", err)
+	}
+	if res.MessageID != "om_root" || res.State != notify.StateDelivered {
+		t.Fatalf("result = %+v", res)
+	}
+	if c.lastText != "" {
+		t.Errorf("text = %q, want card-only send", c.lastText)
+	}
+	var card struct {
+		Schema string `json:"schema"`
+		Body   struct {
+			Elements []map[string]any `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(c.lastCard), &card); err != nil {
+		t.Fatalf("card json: %v", err)
+	}
+	if card.Schema != "2.0" || len(card.Body.Elements) != 2 {
+		t.Fatalf("card = %+v", card)
+	}
+	if content, _ := card.Body.Elements[0]["content"].(string); content != "\\[待你审核\\] Ship \\*this\\*\n正文 \\[link\\]\\(https://example.com\\)" {
+		t.Errorf("escaped card body = %q", content)
+	}
+	button := card.Body.Elements[1]
+	behaviors, _ := button["behaviors"].([]any)
+	if len(behaviors) != 1 {
+		t.Fatalf("button behaviors = %#v", button["behaviors"])
+	}
+	openURL := behaviors[0].(map[string]any)
+	if openURL["default_url"] != ref.WebURL || openURL["pc_url"] != ref.DesktopURL {
+		t.Errorf("open_url behavior = %#v", openURL)
+	}
+	if len(c.textSends) != 1 {
+		t.Fatalf("topic sends = %d, want 1", len(c.textSends))
+	}
+	topic := c.textSends[0]
+	if topic.ChatID != "" || topic.ReplyTarget.MessageID != "om_root" || !topic.ReplyTarget.InThread {
+		t.Errorf("topic send = %+v", topic)
+	}
+}
+
+func TestDeliverDMKeepsDeliveredRootWhenTopicCreationFails(t *testing.T) {
+	c := &recordingDMClient{
+		messageID: "om_root",
+		topicErr:  errors.New("topic unavailable"),
+	}
+	d := NewDMDeliverer(c, testDMCreds, slog.Default())
+
+	res, err := d.DeliverDM(context.Background(), notify.PushRef{
+		DesktopURL: "multica://issue/issue-id?workspace=workspace-id",
+		StartTopic: true,
+	}, db.ChannelUserBinding{ChannelUserID: "ou_recipient"}, "text")
+	if err != nil {
+		t.Fatalf("DeliverDM: %v", err)
+	}
+	if res.State != notify.StateDelivered || res.MessageID != "om_root" {
+		t.Errorf("result = %+v, want delivered root", res)
 	}
 }
 
