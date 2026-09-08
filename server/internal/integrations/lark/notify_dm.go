@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -52,7 +53,7 @@ func (d *dmDeliverer) DeliverDM(ctx context.Context, ref notify.PushRef, binding
 		OpenID:         OpenID(binding.ChannelUserID),
 	}
 	plainText := notify.PlainHead(text)
-	if ref.DesktopURL != "" {
+	if ref.WebURL != "" && ref.DesktopURL != "" {
 		cardJSON, cardErr := issuePushCard(plainText, ref.WebURL, ref.DesktopURL)
 		if cardErr != nil {
 			return notify.DeliverResult{}, cardErr
@@ -110,6 +111,10 @@ func issuePushCard(text, webURL, desktopURL string) (string, error) {
 	if defaultURL == "" {
 		defaultURL = desktopURL
 	}
+	pcURL := desktopBridgeURL(webURL, desktopURL)
+	if pcURL == "" {
+		pcURL = defaultURL
+	}
 	doc := map[string]any{
 		"schema": "2.0",
 		"body": map[string]any{
@@ -129,7 +134,7 @@ func issuePushCard(text, webURL, desktopURL string) (string, error) {
 						map[string]any{
 							"type":        "open_url",
 							"default_url": defaultURL,
-							"pc_url":      desktopURL,
+							"pc_url":      pcURL,
 						},
 					},
 				},
@@ -141,6 +146,43 @@ func issuePushCard(text, webURL, desktopURL string) (string, error) {
 		return "", fmt.Errorf("lark: encode issue push card: %w", err)
 	}
 	return string(raw), nil
+}
+
+// desktopBridgeURL keeps Lark's card URL on HTTPS. Lark Desktop ignores
+// arbitrary custom schemes in open_url behaviors, so the browser handoff page
+// performs the multica:// launch from a normal user-visible web origin and
+// retains the issue URL as a fallback.
+func desktopBridgeURL(webURL, desktopURL string) string {
+	if webURL == "" || desktopURL == "" {
+		return ""
+	}
+	bridge, err := url.Parse(webURL)
+	if err != nil || (bridge.Scheme != "https" && bridge.Scheme != "http") || bridge.Host == "" {
+		return ""
+	}
+	target, err := url.Parse(desktopURL)
+	if err != nil || target.Scheme != "multica" || target.Host != "issue" {
+		return ""
+	}
+	issueID := strings.TrimPrefix(target.Path, "/")
+	workspaceIDs := target.Query()["workspace"]
+	commentIDs := target.Query()["comment"]
+	if issueID == "" || strings.Contains(issueID, "/") || len(workspaceIDs) != 1 || len(commentIDs) > 1 {
+		return ""
+	}
+	query := url.Values{
+		"fallback":  {webURL},
+		"issue":     {issueID},
+		"workspace": {workspaceIDs[0]},
+	}
+	if len(commentIDs) == 1 {
+		query.Set("comment", commentIDs[0])
+	}
+	bridge.Path = "/desktop/open"
+	bridge.RawPath = ""
+	bridge.RawQuery = query.Encode()
+	bridge.Fragment = ""
+	return bridge.String()
 }
 
 // escapeCardMarkdown preserves the push as literal text inside Lark's

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -98,8 +99,8 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 	c := &recordingDMClient{messageID: "om_root"}
 	d := NewDMDeliverer(c, testDMCreds, slog.Default())
 	ref := notify.PushRef{
-		WebURL:     "https://app.example.com/acme/issues/issue-id#comment-comment-id",
-		DesktopURL: "multica://issue/issue-id?workspace=workspace-id&comment=comment-id",
+		WebURL:     "https://app.example.com/acme/issues/11111111-2222-3333-4444-555555555555#comment-99999999-8888-7777-6666-555555555555",
+		DesktopURL: "multica://issue/11111111-2222-3333-4444-555555555555?workspace=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee&comment=99999999-8888-7777-6666-555555555555",
 		StartTopic: true,
 	}
 
@@ -136,8 +137,21 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 		t.Fatalf("button behaviors = %#v", button["behaviors"])
 	}
 	openURL := behaviors[0].(map[string]any)
-	if openURL["default_url"] != ref.WebURL || openURL["pc_url"] != ref.DesktopURL {
+	if openURL["default_url"] != ref.WebURL {
 		t.Errorf("open_url behavior = %#v", openURL)
+	}
+	pcURL, err := url.Parse(openURL["pc_url"].(string))
+	if err != nil {
+		t.Fatalf("pc_url: %v", err)
+	}
+	if pcURL.Scheme != "https" || pcURL.Host != "app.example.com" || pcURL.Path != "/desktop/open" {
+		t.Errorf("pc_url = %q, want HTTPS desktop bridge", pcURL)
+	}
+	if pcURL.Query().Get("issue") != "11111111-2222-3333-4444-555555555555" ||
+		pcURL.Query().Get("workspace") != "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" ||
+		pcURL.Query().Get("comment") != "99999999-8888-7777-6666-555555555555" ||
+		pcURL.Query().Get("fallback") != ref.WebURL {
+		t.Errorf("pc_url query = %#v", pcURL.Query())
 	}
 	if len(c.textSends) != 1 {
 		t.Fatalf("topic sends = %d, want 1", len(c.textSends))
@@ -145,6 +159,12 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 	topic := c.textSends[0]
 	if topic.ChatID != "" || topic.ReplyTarget.MessageID != "om_root" || !topic.ReplyTarget.InThread {
 		t.Errorf("topic send = %+v", topic)
+	}
+}
+
+func TestDesktopBridgeURLRejectsNonWebFallback(t *testing.T) {
+	if got := desktopBridgeURL("javascript:alert(1)", "multica://issue/123"); got != "" {
+		t.Fatalf("desktopBridgeURL = %q, want empty", got)
 	}
 }
 
@@ -164,6 +184,9 @@ func TestDeliverDMKeepsDeliveredRootWhenTopicCreationFails(t *testing.T) {
 	}
 	if res.State != notify.StateDelivered || res.MessageID != "om_root" {
 		t.Errorf("result = %+v, want delivered root", res)
+	}
+	if c.lastCard != "" || c.lastText != "text" {
+		t.Errorf("push without a web fallback = card %q, text %q; want plain text", c.lastCard, c.lastText)
 	}
 }
 
