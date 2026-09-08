@@ -24,6 +24,7 @@ type dmDeliverer struct {
 }
 
 var _ notify.DMDeliverer = (*dmDeliverer)(nil)
+var _ notify.TopicReplyDeliverer = (*dmDeliverer)(nil)
 
 // NewDMDeliverer adapts the Lark client to the shared push layer.
 //
@@ -81,6 +82,25 @@ func (d *dmDeliverer) DeliverDM(ctx context.Context, ref notify.PushRef, binding
 			// rather than returning an error that would leave the root untracked.
 			d.logger.Warn("lark: create push topic", "message_id", messageID, "err", topicErr)
 		}
+	}
+	return notify.DeliverResult{State: notify.StateDelivered, MessageID: messageID}, nil
+}
+
+func (d *dmDeliverer) DeliverTopicReply(ctx context.Context, installationID pgtype.UUID, rootMessageID, text string) (notify.DeliverResult, error) {
+	if rootMessageID == "" || strings.TrimSpace(text) == "" {
+		return notify.DeliverResult{}, nil
+	}
+	creds, err := d.creds(installationID)
+	if err != nil {
+		return notify.DeliverResult{}, err
+	}
+	messageID, err := d.client.SendTextMessage(ctx, SendTextParams{
+		InstallationID: creds,
+		Text:           text,
+		ReplyTarget:    ReplyTarget{MessageID: rootMessageID, InThread: true},
+	})
+	if err != nil {
+		return notify.DeliverResult{}, err
 	}
 	return notify.DeliverResult{State: notify.StateDelivered, MessageID: messageID}, nil
 }

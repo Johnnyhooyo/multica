@@ -3,6 +3,8 @@ package notify
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -93,4 +95,12 @@ type DMDeliverer interface {
 	// conversation and is discarded. Promising one there would tell every
 	// WeCom user to do something that silently does nothing.
 	AcceptsReplies() bool
+}
+
+// TopicReplyDeliverer is the optional capability required to return an agent
+// comment to the exact topic whose push reply caused that run. It is separate
+// from DMDeliverer because platforms such as WeCom can push but cannot address
+// a replyable topic.
+type TopicReplyDeliverer interface {
+	DeliverTopicReply(ctx context.Context, installationID pgtype.UUID, rootMessageID, text string) (DeliverResult, error)
 }

@@ -1877,6 +1877,8 @@ type PreparedChatTaskEnqueue struct {
 	attrSource       pgtype.Text
 	attrEvidenceKind pgtype.Text
 	runtimeOverlay   runtimeMCPOverlayData
+	handoffNote      pgtype.Text
+	evidenceRef      pgtype.UUID
 }
 
 // PrepareChatTaskEnqueue performs reads and optional external integration work
@@ -2107,7 +2109,13 @@ func (s *TaskService) enqueueChatTaskTx(
 		RuntimeConnectedApps: prepared.runtimeOverlay.ConnectedApps,
 		OriginatorSource:     prepared.attrSource,
 		TriggerEvidenceKind:  prepared.attrEvidenceKind,
-		TriggerEvidenceRefID: chatSession.ID,
+		TriggerEvidenceRefID: func() pgtype.UUID {
+			if prepared.evidenceRef.Valid {
+				return prepared.evidenceRef
+			}
+			return chatSession.ID
+		}(),
+		HandoffNote: prepared.handoffNote,
 		ChannelContextRevision: pgtype.Int8{
 			Int64: contextRevision, Valid: contextRevision > 0,
 		},
@@ -4308,8 +4316,155 @@ func startsWithAbsolutePath(s string) bool {
 // causing the new task to resume against a stale (or NULL) session.
 // durableWorkDir is terminal delivery metadata, not a resume pointer: it is
 // populated only after the daemon confirms a disposable worktree is gone.
+type delegatedChatHandoffPlan struct {
+	session      db.ChatSession
+	binding      db.ChannelChatSessionBinding
+	prepared     PreparedChatTaskEnqueue
+	initiatorID  pgtype.UUID
+	sourceTaskID pgtype.UUID
+}
+
+// prepareDelegatedChatHandoff recognizes the narrow lifecycle edge this
+// feature owns: a background issue run delegated directly from Mika's Feishu
+// chat. Other delegation chains and first-party chats keep their existing
+// completion behavior.
+func (s *TaskService) prepareDelegatedChatHandoff(ctx context.Context, taskID pgtype.UUID) (*delegatedChatHandoffPlan, error) {
+	task, err := s.Queries.GetAgentTask(ctx, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if !task.IssueID.Valid || !task.DelegatedFromTaskID.Valid {
+		return nil, nil
+	}
+	source, err := s.Queries.GetAgentTask(ctx, task.DelegatedFromTaskID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !source.ChatSessionID.Valid || !source.InitiatorUserID.Valid {
+		return nil, nil
+	}
+	delivery, err := s.Queries.GetChannelTaskDelivery(ctx, source.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if delivery.ChannelType != "feishu" {
+		return nil, nil
+	}
+	agent, err := s.Queries.GetAgent(ctx, source.AgentID)
+	if err != nil {
+		return nil, err
+	}
+	if !agent.SystemKey.Valid || agent.SystemKey.String != MikaSystemKey {
+		return nil, nil
+	}
+	session, err := s.Queries.GetChatSession(ctx, source.ChatSessionID)
+	if err != nil {
+		return nil, err
+	}
+	binding, err := s.Queries.GetChannelChatSessionBindingBySessionAny(ctx, source.ChatSessionID)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && binding.RetiredAt.Valid) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if binding.ChannelType != "feishu" {
+		return nil, nil
+	}
+	prepared, err := s.PrepareChatTaskEnqueue(ctx, source.AgentID, source.InitiatorUserID)
+	if err != nil {
+		if errors.Is(err, ErrChatTaskAgentArchived) || errors.Is(err, ErrChatTaskAgentNoRuntime) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &delegatedChatHandoffPlan{
+		session: session, binding: binding, prepared: prepared,
+		initiatorID: source.InitiatorUserID, sourceTaskID: source.ID,
+	}, nil
+}
+
+func delegatedChatHandoffNote(issue db.Issue) string {
+	return fmt.Sprintf(
+		"A background task you delegated has reached %s. Issue ID: %s. Read that issue and its latest comments, then resume the member conversation. Give only the context needed for the next decision and ask exactly one highest-priority unresolved question. Include your recommended answer and a brief reason, then wait for the member's response before asking the next question.",
+		issue.Status, util.UUIDToString(issue.ID),
+	)
+}
+
+// enqueueDelegatedChatHandoffTx either starts Mika's first return turn or, if
+// Mika already asked a question after the latest member message, leaves a
+// hidden input for the member's next turn. This is what prevents several
+// background completions from becoming several back-to-back questions.
+func (s *TaskService) enqueueDelegatedChatHandoffTx(ctx context.Context, qtx *db.Queries, completed db.AgentTaskQueue, plan *delegatedChatHandoffPlan) (*db.AgentTaskQueue, error) {
+	issue, err := qtx.GetIssue(ctx, completed.IssueID)
+	if err != nil {
+		return nil, err
+	}
+	effective := issuestatus.Effective(ctx, qtx, issue.WorkspaceID, issue.Status)
+	if effective != issuestatus.InReview && effective != issuestatus.Blocked {
+		return nil, nil
+	}
+	note := delegatedChatHandoffNote(issue)
+	active, err := qtx.HasActiveChatTaskForSession(ctx, plan.session.ID)
+	if err != nil {
+		return nil, err
+	}
+	alreadyAsked, err := qtx.HasDelegationHandoffSinceLastMemberMessage(ctx, plan.session.ID)
+	if err != nil {
+		return nil, err
+	}
+	if active || alreadyAsked {
+		_, err := qtx.CreateChatMessage(ctx, db.CreateChatMessageParams{
+			ID:                     dbid.NewV7(),
+			ChatSessionID:          plan.session.ID,
+			Role:                   "user",
+			Content:                note,
+			MessageKind:            pgtype.Text{String: protocol.ChatMessageKindDelegationHandoff, Valid: true},
+			ChannelIngested:        pgtype.Bool{Bool: true, Valid: true},
+			ChannelContextRevision: pgtype.Int8{Int64: plan.binding.ContextRevision, Valid: true},
+		})
+		return nil, err
+	}
+
+	prepared := plan.prepared
+	prepared.handoffNote = pgtype.Text{String: note, Valid: true}
+	prepared.attrEvidenceKind = pgtype.Text{String: "delegated_completion", Valid: true}
+	prepared.evidenceRef = completed.ID
+	handoff, err := s.enqueueChatTaskTx(
+		ctx, qtx, plan.session, plan.initiatorID, false,
+		plan.binding.ContextRevision, true, plan.binding.ID, plan.binding.RouteRevision, prepared,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := qtx.CreateChatMessage(ctx, db.CreateChatMessageParams{
+		ID:                     dbid.NewV7(),
+		ChatSessionID:          plan.session.ID,
+		Role:                   "user",
+		Content:                note,
+		TaskID:                 handoff.ID,
+		MessageKind:            pgtype.Text{String: protocol.ChatMessageKindDelegationHandoff, Valid: true},
+		ChannelIngested:        pgtype.Bool{Bool: true, Valid: true},
+		ChannelContextRevision: pgtype.Int8{Int64: plan.binding.ContextRevision, Valid: true},
+	}); err != nil {
+		return nil, err
+	}
+	return &handoff, nil
+}
+
 func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir, branchName string, sessionRolloutMissing bool, retiredSessionID, durableWorkDir string) (*db.AgentTaskQueue, error) {
+	handoffPlan, err := s.prepareDelegatedChatHandoff(ctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("prepare delegated chat handoff: %w", err)
+	}
 	var task db.AgentTaskQueue
+	var handoffTask *db.AgentTaskQueue
 	// chatAssistantMsg is the single assistant outcome row written for a chat
 	// task inside the completion transaction below. It is broadcast (chat:done)
 	// only after the transaction commits.
@@ -4386,6 +4541,16 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 				return fmt.Errorf("write chat assistant outcome: %w", err)
 			}
 			chatAssistantMsg = msg
+		}
+		if handoffPlan != nil && t.DelegatedFromTaskID == handoffPlan.sourceTaskID {
+			handoffTask, err = s.enqueueDelegatedChatHandoffTx(ctx, qtx, t, handoffPlan)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) || errors.Is(err, ErrChatSessionArchived) || errors.Is(err, ErrChatTaskAgentArchived) || errors.Is(err, ErrChatTaskAgentNoRuntime) {
+					handoffTask = nil
+				} else {
+					return fmt.Errorf("enqueue delegated chat handoff: %w", err)
+				}
+			}
 		}
 		return nil
 	}); err != nil {
@@ -4469,6 +4634,9 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 				}
 			}
 		}
+	}
+	if handoffTask != nil {
+		s.FinalizeChatTaskEnqueue(ctx, *handoffTask)
 	}
 
 	// Quick-create tasks: locate the issue the agent just created and push

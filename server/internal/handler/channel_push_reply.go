@@ -79,6 +79,13 @@ func (h *Handler) PostPushReplyComment(
 		Type:        "comment",
 	}
 
+	tx, err := h.TxStarter.Begin(ctx)
+	if err != nil {
+		return engine.PushReplyResult{}, fmt.Errorf("begin push reply: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := h.Queries.WithTx(tx)
+
 	var created db.CreateCommentRow
 	var approvedIssue *db.Issue
 	if isExplicitReviewApproval(content) {
@@ -86,13 +93,6 @@ func (h *Handler) PostPushReplyComment(
 		// Without the lock, a stale in_review read could overwrite a concurrent
 		// human transition to another state. Comment-first keeps event revisions
 		// ordered: comment N, then status N+1.
-		tx, txErr := h.TxStarter.Begin(ctx)
-		if txErr != nil {
-			return engine.PushReplyResult{}, fmt.Errorf("begin push reply approval: %w", txErr)
-		}
-		defer tx.Rollback(ctx)
-		qtx := h.Queries.WithTx(tx)
-
 		current, lockErr := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
 			ID: issue.ID, WorkspaceID: issue.WorkspaceID,
 		})
@@ -113,16 +113,30 @@ func (h *Handler) PostPushReplyComment(
 			}
 			approvedIssue = &updated
 		}
-		if commitErr := tx.Commit(ctx); commitErr != nil {
-			return engine.PushReplyResult{}, fmt.Errorf("commit push reply approval: %w", commitErr)
-		}
 	} else {
-		created, err = h.Queries.CreateComment(ctx, createParams)
+		created, err = qtx.CreateComment(ctx, createParams)
 		if err != nil {
 			return engine.PushReplyResult{}, err
 		}
 	}
 	comment := created.Comment()
+	// Production pushes always carry both identifiers. Unit callers that build
+	// a synthetic ChannelPushMessage without a persisted ledger row keep the
+	// older comment-only behavior.
+	if push.InstallationID.Valid && push.ChannelMessageID != "" {
+		if _, err := qtx.AddChannelPushReplyComment(ctx, db.AddChannelPushReplyCommentParams{
+			CommentID:        comment.ID,
+			InstallationID:   push.InstallationID,
+			ChannelMessageID: push.ChannelMessageID,
+			WorkspaceID:      issue.WorkspaceID,
+			IssueID:          issue.ID,
+		}); err != nil {
+			return engine.PushReplyResult{}, fmt.Errorf("record push reply route: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return engine.PushReplyResult{}, fmt.Errorf("commit push reply: %w", err)
+	}
 
 	actorID := uuidToString(senderUserID)
 	resp := commentToResponse(comment, nil, nil)

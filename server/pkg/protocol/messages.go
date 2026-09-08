@@ -240,6 +240,9 @@ const (
 	// the opening self-describes: chat renders the starter cards under this
 	// kind instead of quick-action chips (MUL-5765).
 	ChatMessageKindOnboardingOpening = "onboarding_opening"
+	// ChatMessageKindDelegationHandoff is a server-authored, hidden input that
+	// returns a completed background issue to Mika's originating channel chat.
+	ChatMessageKindDelegationHandoff = "delegation_handoff"
 )
 
 // ChatDonePayload is broadcast when an agent finishes responding to a chat

@@ -369,7 +369,7 @@ INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, chat_session_id,
     initiator_user_id, originator_user_id, accountable_user_id, force_fresh_session, runtime_mcp_overlay,
     runtime_connected_apps, originator_source, trigger_evidence_kind, trigger_evidence_ref_id,
-    fire_at, channel_context_revision, id
+    handoff_note, fire_at, channel_context_revision, id
 )
 SELECT
     $1, $2, NULL,
@@ -383,9 +383,10 @@ SELECT
     $12,
     $13,
     $14,
+    $15,
     $6::timestamptz,
-    $15::bigint,
-    COALESCE($16::uuid, gen_random_uuid())
+    $16::bigint,
+    COALESCE($17::uuid, gen_random_uuid())
 WHERE lock_task_owner_rows($1, NULL, $2)
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision
 `
@@ -405,6 +406,7 @@ type CreateChatTaskParams struct {
 	OriginatorSource       pgtype.Text        `json:"originator_source"`
 	TriggerEvidenceKind    pgtype.Text        `json:"trigger_evidence_kind"`
 	TriggerEvidenceRefID   pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	HandoffNote            pgtype.Text        `json:"handoff_note"`
 	ChannelContextRevision pgtype.Int8        `json:"channel_context_revision"`
 	ID                     pgtype.UUID        `json:"id"`
 }
@@ -432,6 +434,7 @@ func (q *Queries) CreateChatTask(ctx context.Context, arg CreateChatTaskParams) 
 		arg.OriginatorSource,
 		arg.TriggerEvidenceKind,
 		arg.TriggerEvidenceRefID,
+		arg.HandoffNote,
 		arg.ChannelContextRevision,
 		arg.ID,
 	)
@@ -720,7 +723,7 @@ const deleteUserChatMessageByTask = `-- name: DeleteUserChatMessageByTask :one
 DELETE FROM chat_message
 WHERE task_id = $1
   AND role = 'user'
-  AND message_kind <> 'onboarding_kickoff'
+  AND message_kind NOT IN ('onboarding_kickoff', 'delegation_handoff')
 RETURNING id, chat_session_id, role, content, task_id, created_at, failure_reason, elapsed_ms, message_kind, channel_media_pending_until, channel_ingested, quick_actions, channel_context_revision, channel_outbound_type, channel_outbound_installation_id, channel_outbound_chat_id, channel_outbound_message_ids
 `
 
@@ -1181,7 +1184,7 @@ WHERE cs.id = $1
     EXISTS (
       SELECT 1 FROM chat_message AS public_message
       WHERE public_message.chat_session_id = cs.id
-        AND public_message.message_kind != 'channel_command'
+        AND public_message.message_kind NOT IN ('channel_command', 'delegation_handoff')
     )
   )
 `
@@ -1249,6 +1252,32 @@ func (q *Queries) HasActiveChatTaskForSession(ctx context.Context, chatSessionID
 	var has_active bool
 	err := row.Scan(&has_active)
 	return has_active, err
+}
+
+const hasDelegationHandoffSinceLastMemberMessage = `-- name: HasDelegationHandoffSinceLastMemberMessage :one
+SELECT EXISTS (
+  SELECT 1
+  FROM agent_task_queue AS handoff
+  WHERE handoff.chat_session_id = $1
+    AND handoff.trigger_evidence_kind = 'delegated_completion'
+    AND handoff.created_at > COALESCE((
+      SELECT max(message.created_at)
+      FROM chat_message AS message
+      WHERE message.chat_session_id = $1
+        AND message.role = 'user'
+        AND message.message_kind = 'message'
+    ), '-infinity'::timestamptz)
+) AS has_handoff
+`
+
+// Once Mika has been resumed for a background result, later results are added
+// to the next input batch instead of starting more turns before the member has
+// answered Mika's first question.
+func (q *Queries) HasDelegationHandoffSinceLastMemberMessage(ctx context.Context, chatSessionID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasDelegationHandoffSinceLastMemberMessage, chatSessionID)
+	var has_handoff bool
+	err := row.Scan(&has_handoff)
+	return has_handoff, err
 }
 
 const hasPendingChatTasksByCreator = `-- name: HasPendingChatTasksByCreator :one
@@ -1613,7 +1642,7 @@ LEFT JOIN LATERAL (
   SELECT content, role, created_at, failure_reason, message_kind
     FROM chat_message m
    WHERE m.chat_session_id = cs.id
-     AND m.message_kind != 'channel_command'
+     AND m.message_kind NOT IN ('channel_command', 'delegation_handoff')
    ORDER BY m.created_at DESC
    LIMIT 1
 ) lm ON true
@@ -2198,7 +2227,7 @@ LEFT JOIN LATERAL (
   SELECT content, role, created_at, failure_reason, message_kind
     FROM chat_message m
    WHERE m.chat_session_id = cs.id
-     AND m.message_kind != 'channel_command'
+     AND m.message_kind NOT IN ('channel_command', 'delegation_handoff')
    ORDER BY m.created_at DESC
    LIMIT 1
 ) lm ON true

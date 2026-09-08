@@ -177,6 +177,17 @@ func TestVisibleChatMessagesHidesOnboardingKickoff(t *testing.T) {
 	}
 }
 
+func TestVisibleChatMessagesHidesDelegationHandoff(t *testing.T) {
+	messages := []db.ChatMessage{
+		{MessageKind: protocol.ChatMessageKindDelegationHandoff, Content: "internal handoff"},
+		{MessageKind: protocol.ChatMessageKindMessage, Content: "visible answer"},
+	}
+	visible := visibleChatMessages(messages)
+	if len(visible) != 1 || visible[0].Content != "visible answer" {
+		t.Fatalf("visible messages = %#v, want only the assistant answer", visible)
+	}
+}
+
 // Every workspace onboards from scratch. The kickoff is built from this
 // workspace's own inputs only — nothing about what the member did elsewhere
 // reaches the model, so no two workspaces can produce different openings for

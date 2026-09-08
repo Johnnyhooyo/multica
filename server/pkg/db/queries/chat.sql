@@ -34,7 +34,7 @@ WHERE cs.id = $1
     EXISTS (
       SELECT 1 FROM chat_message AS public_message
       WHERE public_message.chat_session_id = cs.id
-        AND public_message.message_kind != 'channel_command'
+        AND public_message.message_kind NOT IN ('channel_command', 'delegation_handoff')
     )
   );
 
@@ -57,7 +57,7 @@ LEFT JOIN LATERAL (
   SELECT content, role, created_at, failure_reason, message_kind
     FROM chat_message m
    WHERE m.chat_session_id = cs.id
-     AND m.message_kind != 'channel_command'
+     AND m.message_kind NOT IN ('channel_command', 'delegation_handoff')
    ORDER BY m.created_at DESC
    LIMIT 1
 ) lm ON true
@@ -94,7 +94,7 @@ LEFT JOIN LATERAL (
   SELECT content, role, created_at, failure_reason, message_kind
     FROM chat_message m
    WHERE m.chat_session_id = cs.id
-     AND m.message_kind != 'channel_command'
+     AND m.message_kind NOT IN ('channel_command', 'delegation_handoff')
    ORDER BY m.created_at DESC
    LIMIT 1
 ) lm ON true
@@ -705,7 +705,7 @@ RETURNING task.*;
 DELETE FROM chat_message
 WHERE task_id = $1
   AND role = 'user'
-  AND message_kind <> 'onboarding_kickoff'
+  AND message_kind NOT IN ('onboarding_kickoff', 'delegation_handoff')
 RETURNING *;
 
 -- name: ReleaseOnboardingKickoffFromTask :exec
@@ -1063,7 +1063,7 @@ INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, status, priority, chat_session_id,
     initiator_user_id, originator_user_id, accountable_user_id, force_fresh_session, runtime_mcp_overlay,
     runtime_connected_apps, originator_source, trigger_evidence_kind, trigger_evidence_ref_id,
-    fire_at, channel_context_revision, id
+    handoff_note, fire_at, channel_context_revision, id
 )
 SELECT
     $1, $2, NULL,
@@ -1077,6 +1077,7 @@ SELECT
     sqlc.narg(originator_source),
     sqlc.narg(trigger_evidence_kind),
     sqlc.narg(trigger_evidence_ref_id),
+    sqlc.narg(handoff_note),
     sqlc.narg('fire_at')::timestamptz,
     sqlc.narg('channel_context_revision')::bigint,
     COALESCE(sqlc.narg('id')::uuid, gen_random_uuid())
@@ -1268,6 +1269,24 @@ SELECT EXISTS (
     AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
     AND regenerate_quick_actions_for IS NULL
 ) AS has_pending;
+
+-- name: HasDelegationHandoffSinceLastMemberMessage :one
+-- Once Mika has been resumed for a background result, later results are added
+-- to the next input batch instead of starting more turns before the member has
+-- answered Mika's first question.
+SELECT EXISTS (
+  SELECT 1
+  FROM agent_task_queue AS handoff
+  WHERE handoff.chat_session_id = $1
+    AND handoff.trigger_evidence_kind = 'delegated_completion'
+    AND handoff.created_at > COALESCE((
+      SELECT max(message.created_at)
+      FROM chat_message AS message
+      WHERE message.chat_session_id = $1
+        AND message.role = 'user'
+        AND message.message_kind = 'message'
+    ), '-infinity'::timestamptz)
+) AS has_handoff;
 
 -- name: GetPendingChatTask :one
 -- Returns the most recent in-flight task for a chat session, if any.

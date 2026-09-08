@@ -167,6 +167,26 @@ func TestDeliverDMKeepsDeliveredRootWhenTopicCreationFails(t *testing.T) {
 	}
 }
 
+func TestDeliverTopicReplyTargetsOriginalPushRoot(t *testing.T) {
+	c := &recordingDMClient{}
+	d := NewDMDeliverer(c, testDMCreds, slog.Default())
+	capable := d.(notify.TopicReplyDeliverer)
+	res, err := capable.DeliverTopicReply(context.Background(), pgtype.UUID{}, "om_root", "agent answer")
+	if err != nil {
+		t.Fatalf("DeliverTopicReply: %v", err)
+	}
+	if res.State != notify.StateDelivered || res.MessageID != "om_topic" {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(c.textSends) != 1 {
+		t.Fatalf("text sends = %d, want 1", len(c.textSends))
+	}
+	got := c.textSends[0]
+	if got.ChatID != "" || got.Text != "agent answer" || got.ReplyTarget.MessageID != "om_root" || !got.ReplyTarget.InThread {
+		t.Fatalf("topic reply params = %+v", got)
+	}
+}
+
 func TestDeliverDMPropagatesAnAPIError(t *testing.T) {
 	c := &recordingDMClient{err: errors.New("lark refused")}
 	d := NewDMDeliverer(c, testDMCreds, slog.Default())

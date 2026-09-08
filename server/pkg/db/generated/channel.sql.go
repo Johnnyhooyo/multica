@@ -54,6 +54,55 @@ func (q *Queries) AcquireChannelWSLease(ctx context.Context, arg AcquireChannelW
 	return i, err
 }
 
+const addChannelPushReplyComment = `-- name: AddChannelPushReplyComment :one
+UPDATE channel_push_message
+SET reply_comment_ids = CASE
+    WHEN NOT ($1::uuid = ANY(reply_comment_ids))
+    THEN array_append(reply_comment_ids, $1::uuid)
+    ELSE reply_comment_ids
+END
+WHERE installation_id = $2
+  AND channel_message_id = $3
+  AND workspace_id = $4
+  AND issue_id = $5
+RETURNING installation_id, channel_type, channel_message_id, workspace_id, recipient_user_id, issue_id, inbox_item_id, created_at, reply_comment_ids, relayed_agent_comment_ids
+`
+
+type AddChannelPushReplyCommentParams struct {
+	CommentID        pgtype.UUID `json:"comment_id"`
+	InstallationID   pgtype.UUID `json:"installation_id"`
+	ChannelMessageID string      `json:"channel_message_id"`
+	WorkspaceID      pgtype.UUID `json:"workspace_id"`
+	IssueID          pgtype.UUID `json:"issue_id"`
+}
+
+// Persists the exact member comment created from a platform reply. The update
+// runs in the same transaction as CreateComment, so an agent can never consume
+// a reply that lost its route back to the originating topic.
+func (q *Queries) AddChannelPushReplyComment(ctx context.Context, arg AddChannelPushReplyCommentParams) (ChannelPushMessage, error) {
+	row := q.db.QueryRow(ctx, addChannelPushReplyComment,
+		arg.CommentID,
+		arg.InstallationID,
+		arg.ChannelMessageID,
+		arg.WorkspaceID,
+		arg.IssueID,
+	)
+	var i ChannelPushMessage
+	err := row.Scan(
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelMessageID,
+		&i.WorkspaceID,
+		&i.RecipientUserID,
+		&i.IssueID,
+		&i.InboxItemID,
+		&i.CreatedAt,
+		&i.ReplyCommentIds,
+		&i.RelayedAgentCommentIds,
+	)
+	return i, err
+}
+
 const advanceChannelChatContextGeneration = `-- name: AdvanceChannelChatContextGeneration :one
 WITH closed AS (
     UPDATE channel_chat_context_generation AS generation
@@ -246,6 +295,72 @@ func (q *Queries) ClaimChannelMediaPendingObjectsForBind(ctx context.Context, ar
 		return nil, err
 	}
 	return items, nil
+}
+
+const claimChannelPushAgentReply = `-- name: ClaimChannelPushAgentReply :one
+WITH source_task AS (
+    SELECT trigger_comment_id, coalesced_comment_ids, delivered_comment_ids
+    FROM agent_task_queue
+    WHERE id = $2
+), matched_push AS (
+    SELECT push.installation_id, push.channel_message_id
+    FROM channel_push_message AS push
+    CROSS JOIN source_task AS task
+    WHERE push.workspace_id = $3
+      AND push.issue_id = $4
+      AND (
+          task.trigger_comment_id = ANY(push.reply_comment_ids)
+          OR task.coalesced_comment_ids && push.reply_comment_ids
+          OR task.delivered_comment_ids && push.reply_comment_ids
+      )
+    ORDER BY push.created_at DESC
+    LIMIT 1
+    FOR UPDATE OF push
+)
+UPDATE channel_push_message AS push
+SET relayed_agent_comment_ids = array_append(
+    push.relayed_agent_comment_ids,
+    $1::uuid
+)
+FROM matched_push
+WHERE push.installation_id = matched_push.installation_id
+  AND push.channel_message_id = matched_push.channel_message_id
+  AND NOT ($1::uuid = ANY(push.relayed_agent_comment_ids))
+RETURNING push.installation_id, push.channel_type, push.channel_message_id, push.workspace_id, push.recipient_user_id, push.issue_id, push.inbox_item_id, push.created_at, push.reply_comment_ids, push.relayed_agent_comment_ids
+`
+
+type ClaimChannelPushAgentReplyParams struct {
+	AgentCommentID pgtype.UUID `json:"agent_comment_id"`
+	SourceTaskID   pgtype.UUID `json:"source_task_id"`
+	WorkspaceID    pgtype.UUID `json:"workspace_id"`
+	IssueID        pgtype.UUID `json:"issue_id"`
+}
+
+// An agent comment belongs to a push topic only when the task that authored it
+// actually consumed a member comment recorded on that push. Claim the agent
+// comment before sending so duplicate/replayed comment:created events cannot
+// post it twice. A failed transport releases the claim below for retry.
+func (q *Queries) ClaimChannelPushAgentReply(ctx context.Context, arg ClaimChannelPushAgentReplyParams) (ChannelPushMessage, error) {
+	row := q.db.QueryRow(ctx, claimChannelPushAgentReply,
+		arg.AgentCommentID,
+		arg.SourceTaskID,
+		arg.WorkspaceID,
+		arg.IssueID,
+	)
+	var i ChannelPushMessage
+	err := row.Scan(
+		&i.InstallationID,
+		&i.ChannelType,
+		&i.ChannelMessageID,
+		&i.WorkspaceID,
+		&i.RecipientUserID,
+		&i.IssueID,
+		&i.InboxItemID,
+		&i.CreatedAt,
+		&i.ReplyCommentIds,
+		&i.RelayedAgentCommentIds,
+	)
+	return i, err
 }
 
 const claimNextChannelMediaPendingObjectForReconcile = `-- name: ClaimNextChannelMediaPendingObjectForReconcile :one
@@ -700,7 +815,7 @@ INSERT INTO channel_push_message (
     $1, $2, $3, $4, $5, $6, $7
 )
 ON CONFLICT (installation_id, channel_message_id) DO NOTHING
-RETURNING installation_id, channel_type, channel_message_id, workspace_id, recipient_user_id, issue_id, inbox_item_id, created_at
+RETURNING installation_id, channel_type, channel_message_id, workspace_id, recipient_user_id, issue_id, inbox_item_id, created_at, reply_comment_ids, relayed_agent_comment_ids
 `
 
 type CreateChannelPushMessageParams struct {
@@ -737,6 +852,8 @@ func (q *Queries) CreateChannelPushMessage(ctx context.Context, arg CreateChanne
 		&i.IssueID,
 		&i.InboxItemID,
 		&i.CreatedAt,
+		&i.ReplyCommentIds,
+		&i.RelayedAgentCommentIds,
 	)
 	return i, err
 }
@@ -1129,7 +1246,7 @@ func (q *Queries) FindChannelBindingForMember(ctx context.Context, arg FindChann
 }
 
 const findChannelPushMessage = `-- name: FindChannelPushMessage :one
-SELECT installation_id, channel_type, channel_message_id, workspace_id, recipient_user_id, issue_id, inbox_item_id, created_at FROM channel_push_message
+SELECT installation_id, channel_type, channel_message_id, workspace_id, recipient_user_id, issue_id, inbox_item_id, created_at, reply_comment_ids, relayed_agent_comment_ids FROM channel_push_message
 WHERE installation_id = $1 AND channel_message_id = $2
 `
 
@@ -1152,6 +1269,8 @@ func (q *Queries) FindChannelPushMessage(ctx context.Context, arg FindChannelPus
 		&i.IssueID,
 		&i.InboxItemID,
 		&i.CreatedAt,
+		&i.ReplyCommentIds,
+		&i.RelayedAgentCommentIds,
 	)
 	return i, err
 }
@@ -2571,6 +2690,33 @@ func (q *Queries) ReleaseChannelMediaPendingObject(ctx context.Context, arg Rele
 		arg.LeaseToken,
 	)
 	return err
+}
+
+const releaseChannelPushAgentReply = `-- name: ReleaseChannelPushAgentReply :execrows
+UPDATE channel_push_message
+SET relayed_agent_comment_ids = array_remove(
+    relayed_agent_comment_ids,
+    $1::uuid
+)
+WHERE installation_id = $2
+  AND channel_message_id = $3
+  AND $1::uuid = ANY(relayed_agent_comment_ids)
+`
+
+type ReleaseChannelPushAgentReplyParams struct {
+	AgentCommentID   pgtype.UUID `json:"agent_comment_id"`
+	InstallationID   pgtype.UUID `json:"installation_id"`
+	ChannelMessageID string      `json:"channel_message_id"`
+}
+
+// Sending failed before a platform message was accepted. Remove the claim so
+// an event replay can retry; delivered claims remain permanent dedup receipts.
+func (q *Queries) ReleaseChannelPushAgentReply(ctx context.Context, arg ReleaseChannelPushAgentReplyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseChannelPushAgentReply, arg.AgentCommentID, arg.InstallationID, arg.ChannelMessageID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const releaseChannelWSLease = `-- name: ReleaseChannelWSLease :exec

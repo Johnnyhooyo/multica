@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/channel/notify"
@@ -112,6 +113,38 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 	if len(tasks) == 0 {
 		t.Fatal("no agent task enqueued: the reply landed but nothing woke up")
 	}
+
+	// --- agent reply returns to the same topic ---------------------------
+	comments := listPushReplyTestComments(t, issueID, wsID)
+	if len(comments) != 1 {
+		t.Fatalf("member comments = %d, want 1", len(comments))
+	}
+	agentCommentID := uuid.NewString()
+	sourceTaskID := uuidToString(tasks[0].ID)
+	n.HandleCommentCreated(events.Event{
+		Type: protocol.EventCommentCreated, WorkspaceID: wsID,
+		ActorType: "agent", ActorID: agentID,
+		Payload: map[string]any{"comment": map[string]any{
+			"id": agentCommentID, "issue_id": issueID, "author_type": "agent",
+			"content": "我已按你的意见更新。", "source_task_id": &sourceTaskID,
+		}},
+	})
+	if fake.topicCalls != 1 || fake.topicRoot != "om_push_1" {
+		t.Fatalf("agent reply route = calls %d root %q, want 1/om_push_1", fake.topicCalls, fake.topicRoot)
+	}
+	// Replaying the same event is a no-op because the claim is persisted on
+	// channel_push_message before the send.
+	n.HandleCommentCreated(events.Event{
+		Type: protocol.EventCommentCreated, WorkspaceID: wsID,
+		ActorType: "agent", ActorID: agentID,
+		Payload: map[string]any{"comment": map[string]any{
+			"id": agentCommentID, "issue_id": issueID, "author_type": "agent",
+			"content": "我已按你的意见更新。", "source_task_id": &sourceTaskID,
+		}},
+	})
+	if fake.topicCalls != 1 {
+		t.Fatalf("replayed agent comment produced %d topic replies, want 1", fake.topicCalls)
+	}
 }
 
 // inboxNewEvent builds the real EventInboxNew payload a push notification
@@ -163,8 +196,10 @@ func inboxNewEvent(t *testing.T, workspaceID, recipientID, issueID, notifType, i
 // platform message id, standing in for the Lark adapter this test proves the
 // notifier <-> router loop around without a live socket.
 type recordingDeliverer struct {
-	calls     int
-	messageID string
+	calls      int
+	messageID  string
+	topicCalls int
+	topicRoot  string
 }
 
 func (d *recordingDeliverer) DeliverDM(context.Context, notify.PushRef, db.ChannelUserBinding, string) (notify.DeliverResult, error) {
@@ -173,3 +208,9 @@ func (d *recordingDeliverer) DeliverDM(context.Context, notify.PushRef, db.Chann
 }
 
 func (d *recordingDeliverer) AcceptsReplies() bool { return true }
+
+func (d *recordingDeliverer) DeliverTopicReply(_ context.Context, _ pgtype.UUID, rootMessageID, _ string) (notify.DeliverResult, error) {
+	d.topicCalls++
+	d.topicRoot = rootMessageID
+	return notify.DeliverResult{State: notify.StateDelivered, MessageID: "om_agent_reply"}, nil
+}

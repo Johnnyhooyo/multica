@@ -2845,6 +2845,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 				message: "failed to load chat input",
 			}
 		}
+		unanswered, resp.HandoffNote = splitDelegationHandoffInput(unanswered, resp.HandoffNote)
 
 		// Input ownership is the claim's fail-closed boundary. Resume-history
 		// reads belong after it: a task that cannot load its input is preserved
@@ -2928,7 +2929,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		// same transaction as the task, so this only fires on genuinely
 		// corrupt state — cancel the just-dispatched task and reject the claim
 		// rather than run the agent with nothing to answer (MUL-4351).
-		if task.ChatInputTaskID.Valid && !resp.ChatIntro && strings.TrimSpace(resp.ChatMessage) == "" {
+		if task.ChatInputTaskID.Valid && !resp.ChatIntro && strings.TrimSpace(resp.ChatMessage) == "" && strings.TrimSpace(resp.HandoffNote) == "" {
 			slog.Error("chat claim: task-owned direct task has no user input; cancelling",
 				"task_id", uuidToString(task.ID),
 				"chat_session_id", uuidToString(cs.ID),
@@ -3281,6 +3282,36 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 	}
 
 	return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, nil
+}
+
+// splitDelegationHandoffInput keeps server-authored background results out of
+// the member-message channel. Pending handoffs are sealed into the next input
+// batch alongside the member's reply, but the daemon must receive them through
+// HandoffNote so the model cannot mistake them for words the member typed.
+func splitDelegationHandoffInput(messages []db.ChatMessage, existingHandoff string) ([]db.ChatMessage, string) {
+	visible := make([]db.ChatMessage, 0, len(messages))
+	notes := make([]string, 0, len(messages)+1)
+	seen := make(map[string]struct{}, len(messages)+1)
+	appendNote := func(note string) {
+		note = strings.TrimSpace(note)
+		if note == "" {
+			return
+		}
+		if _, ok := seen[note]; ok {
+			return
+		}
+		seen[note] = struct{}{}
+		notes = append(notes, note)
+	}
+	appendNote(existingHandoff)
+	for _, message := range messages {
+		if message.MessageKind == protocol.ChatMessageKindDelegationHandoff {
+			appendNote(message.Content)
+			continue
+		}
+		visible = append(visible, message)
+	}
+	return visible, strings.Join(notes, "\n\n")
 }
 
 // worktreeClaimBlockReason returns a user-facing reason when this runtime must

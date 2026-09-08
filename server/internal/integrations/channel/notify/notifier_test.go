@@ -36,12 +36,16 @@ func mustUUID(t *testing.T, s string) pgtype.UUID {
 }
 
 type fakeQueries struct {
-	binding    db.ChannelUserBinding
-	bindingErr error
-	workspace  db.Workspace
-	statusKey  string // what Effective should report for a custom status
-	created    []db.CreateChannelPushMessageParams
-	createErr  error
+	binding      db.ChannelUserBinding
+	bindingErr   error
+	workspace    db.Workspace
+	statusKey    string // what Effective should report for a custom status
+	created      []db.CreateChannelPushMessageParams
+	createErr    error
+	claimedReply db.ChannelPushMessage
+	claimErr     error
+	claimCalls   int
+	released     []db.ReleaseChannelPushAgentReplyParams
 }
 
 func (f *fakeQueries) FindChannelBindingForMember(context.Context, db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error) {
@@ -70,14 +74,31 @@ func (f *fakeQueries) CreateChannelPushMessage(_ context.Context, arg db.CreateC
 	return db.ChannelPushMessage{}, nil
 }
 
+func (f *fakeQueries) ClaimChannelPushAgentReply(_ context.Context, _ db.ClaimChannelPushAgentReplyParams) (db.ChannelPushMessage, error) {
+	f.claimCalls++
+	if f.claimErr != nil {
+		return db.ChannelPushMessage{}, f.claimErr
+	}
+	return f.claimedReply, nil
+}
+
+func (f *fakeQueries) ReleaseChannelPushAgentReply(_ context.Context, arg db.ReleaseChannelPushAgentReplyParams) (int64, error) {
+	f.released = append(f.released, arg)
+	return 1, nil
+}
+
 type fakeAdapter struct {
-	result    DeliverResult
-	err       error
-	noReplies bool
-	calls     int
-	lastRef   PushRef
-	lastTo    db.ChannelUserBinding
-	lastTx    string
+	result     DeliverResult
+	err        error
+	noReplies  bool
+	calls      int
+	lastRef    PushRef
+	lastTo     db.ChannelUserBinding
+	lastTx     string
+	topicCalls int
+	topicRoot  string
+	topicText  string
+	topicErr   error
 }
 
 func (a *fakeAdapter) DeliverDM(_ context.Context, ref PushRef, binding db.ChannelUserBinding, text string) (DeliverResult, error) {
@@ -89,6 +110,13 @@ func (a *fakeAdapter) DeliverDM(_ context.Context, ref PushRef, binding db.Chann
 }
 
 func (a *fakeAdapter) AcceptsReplies() bool { return !a.noReplies }
+
+func (a *fakeAdapter) DeliverTopicReply(_ context.Context, _ pgtype.UUID, rootMessageID, text string) (DeliverResult, error) {
+	a.topicCalls++
+	a.topicRoot = rootMessageID
+	a.topicText = text
+	return DeliverResult{State: StateDelivered, MessageID: "om_agent_reply"}, a.topicErr
+}
 
 func newTestNotifier(t *testing.T, q *fakeQueries, a *fakeAdapter) *Notifier {
 	t.Helper()
@@ -122,6 +150,70 @@ func inReviewEvent() events.Event {
 			"issue_status":   "in_review",
 			"title":          "Ship the thing",
 		}},
+	}
+}
+
+func agentCommentEvent() events.Event {
+	sourceTaskID := "66666666-6666-6666-6666-666666666666"
+	return events.Event{
+		Type: protocol.EventCommentCreated, WorkspaceID: testWorkspace,
+		ActorType: "agent", ActorID: "77777777-7777-7777-7777-777777777777",
+		Payload: map[string]any{"comment": map[string]any{
+			"id": "88888888-8888-8888-8888-888888888888", "issue_id": testIssue,
+			"author_type": "agent", "content": "先确认第一件事：目标用户是谁？",
+			"source_task_id": &sourceTaskID,
+		}},
+	}
+}
+
+func TestAgentCommentReturnsToClaimedPushTopic(t *testing.T) {
+	q := &fakeQueries{claimedReply: db.ChannelPushMessage{
+		InstallationID: mustUUID(t, testInstall), ChannelType: "lark", ChannelMessageID: "om_root",
+	}}
+	a := &fakeAdapter{}
+	n := newTestNotifier(t, q, a)
+	n.HandleCommentCreated(agentCommentEvent())
+	if a.topicCalls != 1 || a.topicRoot != "om_root" {
+		t.Fatalf("topic delivery = calls %d root %q, want 1/om_root", a.topicCalls, a.topicRoot)
+	}
+	if a.topicText != "先确认第一件事：目标用户是谁？" {
+		t.Fatalf("topic text = %q", a.topicText)
+	}
+}
+
+func TestAgentCommentWithoutPushReplyRouteIsNotDelivered(t *testing.T) {
+	q := &fakeQueries{claimErr: pgx.ErrNoRows}
+	a := &fakeAdapter{}
+	n := newTestNotifier(t, q, a)
+	n.HandleCommentCreated(agentCommentEvent())
+	if a.topicCalls != 0 {
+		t.Fatalf("ordinary agent comment produced %d topic replies", a.topicCalls)
+	}
+}
+
+func TestAgentCommentReplayIsNotDeliveredTwice(t *testing.T) {
+	q := &fakeQueries{claimedReply: db.ChannelPushMessage{
+		InstallationID: mustUUID(t, testInstall), ChannelType: "lark", ChannelMessageID: "om_root",
+	}}
+	a := &fakeAdapter{}
+	n := newTestNotifier(t, q, a)
+	n.HandleCommentCreated(agentCommentEvent())
+	q.claimErr = pgx.ErrNoRows
+	n.HandleCommentCreated(agentCommentEvent())
+	if a.topicCalls != 1 {
+		t.Fatalf("replayed event produced %d topic replies, want 1", a.topicCalls)
+	}
+}
+
+func TestAgentCommentFailedTopicSendReleasesClaim(t *testing.T) {
+	q := &fakeQueries{claimedReply: db.ChannelPushMessage{
+		InstallationID: mustUUID(t, testInstall), ChannelType: "lark", ChannelMessageID: "om_root",
+	}}
+	a := &fakeAdapter{topicErr: errors.New("send failed")}
+	n := newTestNotifier(t, q, a)
+	n.HandleCommentCreated(agentCommentEvent())
+	if len(q.released) != 1 {
+		t.Fatalf("released claims = %d, want 1", len(q.released))
 	}
 }
 

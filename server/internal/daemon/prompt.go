@@ -670,7 +670,13 @@ func buildChatPrompt(task Task) string {
 			}
 		}
 	}
-	fmt.Fprintf(&b, "User message:\n%s\n", task.ChatMessage)
+	if task.HandoffNote != "" {
+		b.WriteString("Multica system handoff (this is not a new member message):\n")
+		fmt.Fprintf(&b, "%s\n", task.HandoffNote)
+	}
+	if task.ChatMessage != "" && strings.TrimSpace(task.ChatMessage) != strings.TrimSpace(task.HandoffNote) {
+		fmt.Fprintf(&b, "User message:\n%s\n", task.ChatMessage)
+	}
 	// List attachments by id + filename so the agent can fetch them via
 	// the CLI. We deliberately do NOT inline the URL: chat attachments
 	// live behind a signed CDN with a short TTL, so by the time the agent

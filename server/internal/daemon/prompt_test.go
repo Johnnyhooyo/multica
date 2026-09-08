@@ -75,6 +75,39 @@ func TestBuildQuickCreatePromptRules(t *testing.T) {
 	}
 }
 
+func TestBuildChatPromptLabelsDelegationHandoffAsSystemContext(t *testing.T) {
+	note := "Read issue 123 and ask exactly one unresolved question."
+	out := buildChatPrompt(Task{
+		ChatSessionID:   "session-1",
+		ChatChannelType: "feishu",
+		ChatMessage:     note,
+		HandoffNote:     note,
+	})
+	if !strings.Contains(out, "Multica system handoff (this is not a new member message):\n"+note) {
+		t.Fatalf("chat prompt did not label the handoff as system context:\n%s", out)
+	}
+	if strings.Contains(out, "User message:\n"+note) {
+		t.Fatalf("chat prompt misrepresented the handoff as a member message:\n%s", out)
+	}
+}
+
+func TestBuildChatPromptKeepsMemberReplyBesideDelegationHandoff(t *testing.T) {
+	out := buildChatPrompt(Task{
+		ChatSessionID:   "session-1",
+		ChatChannelType: "feishu",
+		ChatMessage:     "目标用户是独立开发者。",
+		HandoffNote:     "A second background review is ready.",
+	})
+	for _, want := range []string{
+		"Multica system handoff (this is not a new member message):\nA second background review is ready.",
+		"User message:\n目标用户是独立开发者。",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("chat prompt missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestBuildQuickCreatePromptSeparatesInstructionFromCapturedContext(t *testing.T) {
 	out := buildQuickCreatePrompt(Task{
 		QuickCreatePrompt:        "Implement the new follow-up",

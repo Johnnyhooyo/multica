@@ -34,6 +34,8 @@ type Queries interface {
 	FindChannelBindingForMember(ctx context.Context, arg db.FindChannelBindingForMemberParams) (db.ChannelUserBinding, error)
 	GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error)
 	CreateChannelPushMessage(ctx context.Context, arg db.CreateChannelPushMessageParams) (db.ChannelPushMessage, error)
+	ClaimChannelPushAgentReply(ctx context.Context, arg db.ClaimChannelPushAgentReplyParams) (db.ChannelPushMessage, error)
+	ReleaseChannelPushAgentReply(ctx context.Context, arg db.ReleaseChannelPushAgentReplyParams) (int64, error)
 }
 
 // Metrics records the fate of every push. The notifier defines the interface
@@ -117,6 +119,91 @@ func (n *Notifier) Subscribe(bus *events.Bus) {
 	bus.Subscribe(protocol.EventInboxNew, func(e events.Event) {
 		go n.HandleInboxNew(e)
 	})
+	bus.Subscribe(protocol.EventCommentCreated, func(e events.Event) {
+		go n.HandleCommentCreated(e)
+	})
+}
+
+// HandleCommentCreated returns an agent's answer to the exact push topic whose
+// member reply caused the task. Ordinary issue comments have no persisted
+// reply edge and are deliberately ignored, preventing unrelated work from
+// reopening or interleaving notification topics.
+func (n *Notifier) HandleCommentCreated(e events.Event) {
+	if e.ActorType != "agent" {
+		return
+	}
+	payload, ok := e.Payload.(map[string]any)
+	if !ok {
+		return
+	}
+	comment, ok := payload["comment"].(map[string]any)
+	if !ok || itemString(comment, "author_type") != "agent" {
+		return
+	}
+	commentID, ok := parseItemUUID(comment, "id")
+	if !ok {
+		return
+	}
+	issueID, ok := parseItemUUID(comment, "issue_id")
+	if !ok {
+		return
+	}
+	sourceTaskID, ok := parseItemUUID(comment, "source_task_id")
+	if !ok {
+		return
+	}
+	workspaceID, err := util.ParseUUID(e.WorkspaceID)
+	if err != nil || !workspaceID.Valid {
+		return
+	}
+	content := strings.TrimSpace(itemString(comment, "content"))
+	if content == "" {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
+	defer cancel()
+	push, err := n.q.ClaimChannelPushAgentReply(ctx, db.ClaimChannelPushAgentReplyParams{
+		SourceTaskID:   sourceTaskID,
+		WorkspaceID:    workspaceID,
+		IssueID:        issueID,
+		AgentCommentID: commentID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return
+	}
+	if err != nil {
+		n.logger.WarnContext(ctx, "notify: claim push topic reply", "error", err, "comment_id", util.UUIDToString(commentID))
+		return
+	}
+	adapter, ok := n.adapters[push.ChannelType]
+	if !ok {
+		n.releaseAgentReply(push, commentID)
+		return
+	}
+	topic, ok := adapter.(TopicReplyDeliverer)
+	if !ok {
+		n.releaseAgentReply(push, commentID)
+		return
+	}
+	if _, err := topic.DeliverTopicReply(ctx, push.InstallationID, push.ChannelMessageID, content); err != nil {
+		n.releaseAgentReply(push, commentID)
+		n.logger.WarnContext(ctx, "notify: push topic reply failed", "error", err, "channel_type", push.ChannelType, "comment_id", util.UUIDToString(commentID))
+	}
+}
+
+func (n *Notifier) releaseAgentReply(push db.ChannelPushMessage, commentID pgtype.UUID) {
+	// Delivery may have failed because its context expired. Use a fresh bounded
+	// context so the durable claim is actually released for event replay.
+	ctx, cancel := context.WithTimeout(context.Background(), deliverTimeout)
+	defer cancel()
+	if _, err := n.q.ReleaseChannelPushAgentReply(ctx, db.ReleaseChannelPushAgentReplyParams{
+		AgentCommentID:   commentID,
+		InstallationID:   push.InstallationID,
+		ChannelMessageID: push.ChannelMessageID,
+	}); err != nil {
+		n.logger.WarnContext(ctx, "notify: release push topic reply claim", "error", err, "comment_id", util.UUIDToString(commentID))
+	}
 }
 
 // HandleInboxNew is the inbox:new subscriber.

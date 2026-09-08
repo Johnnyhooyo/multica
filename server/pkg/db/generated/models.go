@@ -433,14 +433,16 @@ type ChannelOutboundMessage struct {
 }
 
 type ChannelPushMessage struct {
-	InstallationID   pgtype.UUID        `json:"installation_id"`
-	ChannelType      string             `json:"channel_type"`
-	ChannelMessageID string             `json:"channel_message_id"`
-	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
-	RecipientUserID  pgtype.UUID        `json:"recipient_user_id"`
-	IssueID          pgtype.UUID        `json:"issue_id"`
-	InboxItemID      pgtype.UUID        `json:"inbox_item_id"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	InstallationID         pgtype.UUID        `json:"installation_id"`
+	ChannelType            string             `json:"channel_type"`
+	ChannelMessageID       string             `json:"channel_message_id"`
+	WorkspaceID            pgtype.UUID        `json:"workspace_id"`
+	RecipientUserID        pgtype.UUID        `json:"recipient_user_id"`
+	IssueID                pgtype.UUID        `json:"issue_id"`
+	InboxItemID            pgtype.UUID        `json:"inbox_item_id"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	ReplyCommentIds        []pgtype.UUID      `json:"reply_comment_ids"`
+	RelayedAgentCommentIds []pgtype.UUID      `json:"relayed_agent_comment_ids"`
 }
 
 type ChannelTaskDelivery struct {

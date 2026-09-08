@@ -1225,6 +1225,69 @@ RETURNING *;
 SELECT * FROM channel_push_message
 WHERE installation_id = $1 AND channel_message_id = $2;
 
+-- name: AddChannelPushReplyComment :one
+-- Persists the exact member comment created from a platform reply. The update
+-- runs in the same transaction as CreateComment, so an agent can never consume
+-- a reply that lost its route back to the originating topic.
+UPDATE channel_push_message
+SET reply_comment_ids = CASE
+    WHEN NOT (sqlc.arg('comment_id')::uuid = ANY(reply_comment_ids))
+    THEN array_append(reply_comment_ids, sqlc.arg('comment_id')::uuid)
+    ELSE reply_comment_ids
+END
+WHERE installation_id = sqlc.arg('installation_id')
+  AND channel_message_id = sqlc.arg('channel_message_id')
+  AND workspace_id = sqlc.arg('workspace_id')
+  AND issue_id = sqlc.arg('issue_id')
+RETURNING *;
+
+-- name: ClaimChannelPushAgentReply :one
+-- An agent comment belongs to a push topic only when the task that authored it
+-- actually consumed a member comment recorded on that push. Claim the agent
+-- comment before sending so duplicate/replayed comment:created events cannot
+-- post it twice. A failed transport releases the claim below for retry.
+WITH source_task AS (
+    SELECT trigger_comment_id, coalesced_comment_ids, delivered_comment_ids
+    FROM agent_task_queue
+    WHERE id = sqlc.arg('source_task_id')
+), matched_push AS (
+    SELECT push.installation_id, push.channel_message_id
+    FROM channel_push_message AS push
+    CROSS JOIN source_task AS task
+    WHERE push.workspace_id = sqlc.arg('workspace_id')
+      AND push.issue_id = sqlc.arg('issue_id')
+      AND (
+          task.trigger_comment_id = ANY(push.reply_comment_ids)
+          OR task.coalesced_comment_ids && push.reply_comment_ids
+          OR task.delivered_comment_ids && push.reply_comment_ids
+      )
+    ORDER BY push.created_at DESC
+    LIMIT 1
+    FOR UPDATE OF push
+)
+UPDATE channel_push_message AS push
+SET relayed_agent_comment_ids = array_append(
+    push.relayed_agent_comment_ids,
+    sqlc.arg('agent_comment_id')::uuid
+)
+FROM matched_push
+WHERE push.installation_id = matched_push.installation_id
+  AND push.channel_message_id = matched_push.channel_message_id
+  AND NOT (sqlc.arg('agent_comment_id')::uuid = ANY(push.relayed_agent_comment_ids))
+RETURNING push.*;
+
+-- name: ReleaseChannelPushAgentReply :execrows
+-- Sending failed before a platform message was accepted. Remove the claim so
+-- an event replay can retry; delivered claims remain permanent dedup receipts.
+UPDATE channel_push_message
+SET relayed_agent_comment_ids = array_remove(
+    relayed_agent_comment_ids,
+    sqlc.arg('agent_comment_id')::uuid
+)
+WHERE installation_id = sqlc.arg('installation_id')
+  AND channel_message_id = sqlc.arg('channel_message_id')
+  AND sqlc.arg('agent_comment_id')::uuid = ANY(relayed_agent_comment_ids);
+
 -- name: DeleteExpiredChannelPushMessages :execrows
 -- Retention sweep. A push older than the cutoff is no longer a live
 -- decision prompt; keeping the row would only grow the table.
