@@ -51,6 +51,16 @@ type DeliverResult struct {
 	MessageID string
 }
 
+// PushCardContent keeps trusted notification structure separate from the
+// platform-neutral text fallback. Card-capable adapters can render the title,
+// body, and action hint as distinct elements without parsing a string that
+// mixes system copy with member-authored Markdown.
+type PushCardContent struct {
+	Title     string
+	Body      string
+	ReplyHint string
+}
+
 // PushRef identifies the inbox row a push came from.
 //
 // It exists because WeCom's cross-replica relay claims work under
@@ -60,7 +70,10 @@ type DeliverResult struct {
 type PushRef struct {
 	InboxItemID     string
 	RecipientUserID string
-	// WebURL is the ordinary HTTPS fallback for opening the notification's
+	// Card carries the semantic fields used by card-capable adapters. Plain-text
+	// adapters continue to use the separate text argument to DeliverDM.
+	Card PushCardContent
+	// WebURL is the ordinary HTTP(S) fallback for opening the notification's
 	// resource. DesktopURL is the installed-app target for platforms that can
 	// choose a PC-specific URL (Lark cards do). Empty values mean the inbox
 	// item has no issue resource to open.

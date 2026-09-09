@@ -314,9 +314,10 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	// reply AND the platform can carry one back. WeCom fails the second half,
 	// so its pushes render without the reply hint and rely on the deep link.
 	replyable := decision.Replyable && adapter.AcceptsReplies()
-	text := renderPush(item, util.UUIDToString(workspaceID), slug, effective, replyable)
+	push := buildPush(item, util.UUIDToString(workspaceID), slug, effective, replyable)
+	text := push.Text()
 	if text == "" {
-		// renderPush returns "" only when the item has neither a title nor a
+		// push.Text returns "" only when the item has neither a title nor a
 		// type, which the whitelist should already have rejected.
 		n.logger.WarnContext(ctx, "notify: whitelisted item rendered to nothing",
 			"notif_type", notifType, "workspace_id", util.UUIDToString(workspaceID))
@@ -327,7 +328,8 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	ref := PushRef{
 		InboxItemID:     util.UUIDToString(inboxItemID),
 		RecipientUserID: util.UUIDToString(recipientID),
-		WebURL:          pushLink(item, util.UUIDToString(workspaceID), slug),
+		Card:            push.Card,
+		WebURL:          push.Link,
 		DesktopURL:      pushDesktopLink(item, util.UUIDToString(workspaceID)),
 		StartTopic:      replyable && pushItemIssueID(item) != "",
 	}
@@ -447,16 +449,17 @@ func parseItemUUID(item map[string]any, key string) (pgtype.UUID, bool) {
 // pushAppURL resolves the frontend URL for building the deep link. Precedence
 // is WECOM_APP_URL, then MULTICA_APP_URL, then FRONTEND_ORIGIN — WeCom's
 // per-tenant override stays first because it was the only push channel before
-// this package existed and its deployments already set it. Only HTTPS values
-// are accepted; a non-HTTPS override is silently dropped so a misconfigured
-// env cannot leak an http:// URL into a user chat.
+// this package existed and its deployments already set it. HTTP and HTTPS are
+// accepted so private-network and local self-hosted deployments can link back;
+// unsupported schemes and malformed URLs are silently dropped.
 func pushAppURL() string {
 	for _, name := range []string{"WECOM_APP_URL", "MULTICA_APP_URL", "FRONTEND_ORIGIN"} {
 		v := strings.TrimSpace(os.Getenv(name))
 		if v == "" {
 			continue
 		}
-		if !strings.HasPrefix(v, "https://") {
+		parsed, err := url.Parse(v)
+		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
 			continue
 		}
 		return strings.TrimRight(v, "/")
@@ -733,26 +736,21 @@ func truncateRunes(s string, maxRunes int) string {
 	return s
 }
 
-// renderPush builds the pushed message from an inbox_item payload. It is
-// platform-neutral: per-platform escaping and length budgets belong to the
-// adapter, which applies them to this output (see FitPush).
-//
-// Format:
-//
-//	**[{label}] {title}**
-//	{body}
-//	{deep link}
-//	{reply hint, when replyable}
-//
-// Returns "" when both title and type are empty — nothing worth sending.
-func renderPush(item map[string]any, workspaceID, slug, effectiveStatus string, replyable bool) string {
+type renderedPush struct {
+	Card PushCardContent
+	Link string
+}
+
+// buildPush keeps the semantic card fields and the plain-text fallback sourced
+// from one decision. This prevents a card adapter from having to parse trusted
+// labels and hints back out of a string containing member-authored Markdown.
+func buildPush(item map[string]any, workspaceID, slug, effectiveStatus string, replyable bool) renderedPush {
 	title, _ := item["title"].(string)
 	typeStr, _ := item["type"].(string)
 	if title == "" && typeStr == "" {
-		return ""
+		return renderedPush{}
 	}
 	body := pushItemBody(item)
-	link := pushLink(item, workspaceID, slug)
 	label := pushTypeLabel(typeStr)
 	hint := replyHint
 	if typeStr == "status_changed" {
@@ -767,26 +765,58 @@ func renderPush(item map[string]any, workspaceID, slug, effectiveStatus string, 
 			hint = blockedReplyHint
 		}
 	}
-
-	var b strings.Builder
-	b.WriteString("**[")
-	b.WriteString(label)
-	b.WriteString("] ")
-	b.WriteString(title)
-	b.WriteString("**")
-	if body != "" {
-		b.WriteString("\n")
-		b.WriteString(body)
-	}
-	if link != "" {
-		b.WriteString("\n")
-		b.WriteString(link)
+	card := PushCardContent{
+		Title: "[" + label + "] " + title,
+		Body:  body,
 	}
 	if replyable {
+		card.ReplyHint = hint
+	}
+	return renderedPush{
+		Card: card,
+		Link: pushLink(item, workspaceID, slug),
+	}
+}
+
+// Text renders the platform-neutral fallback. Per-platform escaping and
+// length budgets belong to the adapter, which applies them to this output
+// (see FitPush).
+//
+// Format:
+//
+//	**[{label}] {title}**
+//	{body}
+//	{deep link}
+//	{reply hint, when replyable}
+//
+// Returns "" when buildPush found nothing worth sending.
+func (p renderedPush) Text() string {
+	if p.Card.Title == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("**")
+	b.WriteString(p.Card.Title)
+	b.WriteString("**")
+	if p.Card.Body != "" {
 		b.WriteString("\n")
-		b.WriteString(hint)
+		b.WriteString(p.Card.Body)
+	}
+	if p.Link != "" {
+		b.WriteString("\n")
+		b.WriteString(p.Link)
+	}
+	if p.Card.ReplyHint != "" {
+		b.WriteString("\n")
+		b.WriteString(p.Card.ReplyHint)
 	}
 	return b.String()
+}
+
+// renderPush remains the focused text-rendering seam used by platform-neutral
+// tests and non-card adapters.
+func renderPush(item map[string]any, workspaceID, slug, effectiveStatus string, replyable bool) string {
+	return buildPush(item, workspaceID, slug, effectiveStatus, replyable).Text()
 }
 
 func prependPushBody(prefix, body string) string {

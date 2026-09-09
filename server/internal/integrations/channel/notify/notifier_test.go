@@ -325,6 +325,15 @@ func TestNotifierCarriesConfirmationContentAndCommentLink(t *testing.T) {
 	if !a.lastRef.StartTopic {
 		t.Error("StartTopic = false, want true for a replyable Issue push")
 	}
+	if a.lastRef.Card.Title != "[待你审核] Ship the thing" {
+		t.Errorf("Card.Title = %q", a.lastRef.Card.Title)
+	}
+	if !strings.Contains(a.lastRef.Card.Body, "请确认方案 A") || !strings.Contains(a.lastRef.Card.Body, "https://docs.example.com/design") {
+		t.Errorf("Card.Body = %q", a.lastRef.Card.Body)
+	}
+	if a.lastRef.Card.ReplyHint != reviewReplyHint {
+		t.Errorf("Card.ReplyHint = %q", a.lastRef.Card.ReplyHint)
+	}
 }
 
 // A platform that cannot carry a reply back must not be handed a message

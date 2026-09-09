@@ -102,11 +102,16 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 		WebURL:     "https://app.example.com/acme/issues/11111111-2222-3333-4444-555555555555#comment-99999999-8888-7777-6666-555555555555",
 		DesktopURL: "multica://issue/11111111-2222-3333-4444-555555555555?workspace=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee&comment=99999999-8888-7777-6666-555555555555",
 		StartTopic: true,
+		Card: notify.PushCardContent{
+			Title:     "[待你审核] Ship *this*",
+			Body:      "正文 **重点**\n- 核对结果\n[伪装链接](https://evil.example)\n<at id=all>所有人</at>",
+			ReplyHint: "审核通过可回复「审核通过」；需要修改请直接说明。",
+		},
 	}
 
 	res, err := d.DeliverDM(context.Background(), ref,
 		db.ChannelUserBinding{ChannelUserID: "ou_recipient"},
-		"**[待你审核] Ship *this***\n正文 [link](https://example.com)")
+		"**[待你审核] Ship *this***\n正文 **重点**")
 	if err != nil {
 		t.Fatalf("DeliverDM: %v", err)
 	}
@@ -118,20 +123,47 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 	}
 	var card struct {
 		Schema string `json:"schema"`
-		Body   struct {
+		Config struct {
+			Summary struct {
+				Content string `json:"content"`
+			} `json:"summary"`
+		} `json:"config"`
+		Header struct {
+			Title struct {
+				Tag     string `json:"tag"`
+				Content string `json:"content"`
+			} `json:"title"`
+		} `json:"header"`
+		Body struct {
 			Elements []map[string]any `json:"elements"`
 		} `json:"body"`
 	}
 	if err := json.Unmarshal([]byte(c.lastCard), &card); err != nil {
 		t.Fatalf("card json: %v", err)
 	}
-	if card.Schema != "2.0" || len(card.Body.Elements) != 2 {
+	if card.Schema != "2.0" || len(card.Body.Elements) != 3 {
 		t.Fatalf("card = %+v", card)
 	}
-	if content, _ := card.Body.Elements[0]["content"].(string); content != "\\[待你审核\\] Ship \\*this\\*\n正文 \\[link\\]\\(https://example.com\\)" {
-		t.Errorf("escaped card body = %q", content)
+	if card.Header.Title.Tag != "plain_text" || card.Header.Title.Content != ref.Card.Title {
+		t.Errorf("card header = %+v", card.Header.Title)
 	}
-	button := card.Body.Elements[1]
+	if card.Config.Summary.Content != ref.Card.Title {
+		t.Errorf("card summary = %q", card.Config.Summary.Content)
+	}
+	body, _ := card.Body.Elements[0]["content"].(string)
+	for _, want := range []string{"正文 **重点**", "- 核对结果", "[伪装链接] (https://evil.example)", "\\<at id=all>所有人\\</at>"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("safe markdown body %q does not contain %q", body, want)
+		}
+	}
+	if strings.Contains(body, "](") || strings.Contains(body, "\n<at") {
+		t.Errorf("unsafe markdown survived in card body: %q", body)
+	}
+	hint, _ := card.Body.Elements[1]["content"].(string)
+	if !strings.HasPrefix(hint, "**处理方式**\n") || !strings.Contains(hint, "审核通过") {
+		t.Errorf("card reply hint = %q", hint)
+	}
+	button := card.Body.Elements[2]
 	behaviors, _ := button["behaviors"].([]any)
 	if len(behaviors) != 1 {
 		t.Fatalf("button behaviors = %#v", button["behaviors"])
@@ -159,6 +191,21 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 	topic := c.textSends[0]
 	if topic.ChatID != "" || topic.ReplyTarget.MessageID != "om_root" || !topic.ReplyTarget.InThread {
 		t.Errorf("topic send = %+v", topic)
+	}
+}
+
+func TestSanitizeIssueCardMarkdownKeepsFormattingAndBreaksImpersonation(t *testing.T) {
+	in := "## 结果\n- **通过**\n- `code`\n[重置密码](https://evil.example)\n[重置密码]: https://evil.example\n<at id=all>所有人</at>\n\\<at id=all>"
+	got := sanitizeIssueCardMarkdown(in)
+	for _, want := range []string{"## 结果", "- **通过**", "- `code`"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("sanitizeIssueCardMarkdown() = %q, lost %q", got, want)
+		}
+	}
+	for _, unsafe := range []string{"](", "]:", "\n<at"} {
+		if strings.Contains(got, unsafe) {
+			t.Errorf("sanitizeIssueCardMarkdown() = %q, retained %q", got, unsafe)
+		}
 	}
 }
 

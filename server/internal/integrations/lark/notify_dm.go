@@ -53,8 +53,8 @@ func (d *dmDeliverer) DeliverDM(ctx context.Context, ref notify.PushRef, binding
 		OpenID:         OpenID(binding.ChannelUserID),
 	}
 	plainText := notify.PlainHead(text)
-	if ref.WebURL != "" && ref.DesktopURL != "" {
-		cardJSON, cardErr := issuePushCard(plainText, ref.WebURL, ref.DesktopURL)
+	if ref.WebURL != "" && ref.DesktopURL != "" && ref.Card.Title != "" {
+		cardJSON, cardErr := issuePushCard(ref.Card, ref.WebURL, ref.DesktopURL)
 		if cardErr != nil {
 			return notify.DeliverResult{}, cardErr
 		}
@@ -106,7 +106,7 @@ func (d *dmDeliverer) DeliverTopicReply(ctx context.Context, installationID pgty
 	return notify.DeliverResult{State: notify.StateDelivered, MessageID: messageID}, nil
 }
 
-func issuePushCard(text, webURL, desktopURL string) (string, error) {
+func issuePushCard(content notify.PushCardContent, webURL, desktopURL string) (string, error) {
 	defaultURL := webURL
 	if defaultURL == "" {
 		defaultURL = desktopURL
@@ -115,30 +115,48 @@ func issuePushCard(text, webURL, desktopURL string) (string, error) {
 	if pcURL == "" {
 		pcURL = defaultURL
 	}
+	elements := make([]any, 0, 3)
+	if content.Body != "" {
+		elements = append(elements, map[string]any{
+			"tag":     "markdown",
+			"content": sanitizeIssueCardMarkdown(content.Body),
+		})
+	}
+	if content.ReplyHint != "" {
+		elements = append(elements, map[string]any{
+			"tag":     "markdown",
+			"content": "**处理方式**\n" + escapeCardMarkdown(content.ReplyHint),
+		})
+	}
+	elements = append(elements, map[string]any{
+		"tag":  "button",
+		"type": "primary",
+		"text": map[string]any{
+			"tag":     "plain_text",
+			"content": "在 Multica 中查看",
+		},
+		"behaviors": []any{
+			map[string]any{
+				"type":        "open_url",
+				"default_url": defaultURL,
+				"pc_url":      pcURL,
+			},
+		},
+	})
 	doc := map[string]any{
 		"schema": "2.0",
-		"body": map[string]any{
-			"elements": []any{
-				map[string]any{
-					"tag":     "markdown",
-					"content": escapeCardMarkdown(text),
-				},
-				map[string]any{
-					"tag":  "button",
-					"type": "primary",
-					"text": map[string]any{
-						"tag":     "plain_text",
-						"content": "在 Multica 中查看",
-					},
-					"behaviors": []any{
-						map[string]any{
-							"type":        "open_url",
-							"default_url": defaultURL,
-							"pc_url":      pcURL,
-						},
-					},
-				},
+		"config": map[string]any{
+			"summary": map[string]any{"content": content.Title},
+		},
+		"header": map[string]any{
+			"template": "grey",
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": content.Title,
 			},
+		},
+		"body": map[string]any{
+			"elements": elements,
 		},
 	}
 	raw, err := json.Marshal(doc)
@@ -148,7 +166,7 @@ func issuePushCard(text, webURL, desktopURL string) (string, error) {
 	return string(raw), nil
 }
 
-// desktopBridgeURL keeps Lark's card URL on HTTPS. Lark Desktop ignores
+// desktopBridgeURL keeps Lark's card URL on HTTP(S). Lark Desktop ignores
 // arbitrary custom schemes in open_url behaviors, so the browser handoff page
 // performs the multica:// launch from a normal user-visible web origin and
 // retains the issue URL as a fallback.
@@ -185,10 +203,23 @@ func desktopBridgeURL(webURL, desktopURL string) string {
 	return bridge.String()
 }
 
-// escapeCardMarkdown preserves the push as literal text inside Lark's
-// schema-2.0 markdown element. The shared renderer may contain user-authored
-// content, so allowing its markdown tokens through would let a task reshape
-// the notification card around the trusted action button.
+// sanitizeIssueCardMarkdown preserves useful formatting while preventing
+// member-authored content from creating a hidden link or a Lark-native tag
+// under the bot's identity. Bare URLs remain visible and can still be
+// auto-linked by the client; bold, lists, quotes, tables, and code survive.
+// Card structure, title, action guidance, and the trusted button live in
+// separate JSON fields, so body Markdown can never inject another element.
+func sanitizeIssueCardMarkdown(text string) string {
+	replacer := strings.NewReplacer(
+		"\\", "\\\\",
+		"](", "] (",
+		"]:", "] :",
+		"<", "\\<",
+	)
+	return replacer.Replace(text)
+}
+
+// escapeCardMarkdown renders trusted plain text inside one markdown element.
 func escapeCardMarkdown(text string) string {
 	replacer := strings.NewReplacer(
 		"\\", "\\\\",

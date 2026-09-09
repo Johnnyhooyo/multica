@@ -6,6 +6,36 @@ import (
 	"unicode/utf8"
 )
 
+func TestPushAppURLAllowsHTTPAndHTTPS(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{name: "HTTPS", url: "https://app.example.com/", want: "https://app.example.com"},
+		{name: "HTTP", url: "http://10.10.186.34:3000/", want: "http://10.10.186.34:3000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("WECOM_APP_URL", "")
+			t.Setenv("MULTICA_APP_URL", tt.url)
+			t.Setenv("FRONTEND_ORIGIN", "")
+			if got := pushAppURL(); got != tt.want {
+				t.Errorf("pushAppURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPushAppURLSkipsUnsupportedOrMalformedURLs(t *testing.T) {
+	t.Setenv("WECOM_APP_URL", "javascript:alert(1)")
+	t.Setenv("MULTICA_APP_URL", "http://")
+	t.Setenv("FRONTEND_ORIGIN", "http://127.0.0.1:3000/")
+	if got := pushAppURL(); got != "http://127.0.0.1:3000" {
+		t.Errorf("pushAppURL() = %q, want HTTP fallback", got)
+	}
+}
+
 func TestPushDesktopLink(t *testing.T) {
 	const commentID = "66666666-6666-6666-6666-666666666666"
 	item := map[string]any{
