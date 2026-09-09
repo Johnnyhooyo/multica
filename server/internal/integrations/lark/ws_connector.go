@@ -88,6 +88,11 @@ type WSConnectorConfig struct {
 	// should not tear down the entire connection.
 	FrameDecoder FrameDecoder
 
+	// CardActionHandler receives synchronous card.action.trigger callbacks.
+	// When configured, FrameDecoder must also implement CardActionDecoder so
+	// the connector can return a card update in the long-connection ACK.
+	CardActionHandler CardActionHandler
+
 	// Enricher optionally expands a decoded message's body with the
 	// context the user explicitly attached (quoted reply / forwarded
 	// bundle) before it is emitted to the dispatcher. It runs on the
@@ -176,6 +181,11 @@ func NewWSLongConnConnector(cfg WSConnectorConfig) (*WSLongConnConnector, error)
 	}
 	if cfg.FrameDecoder == nil {
 		return nil, errors.New("lark ws connector: FrameDecoder is required")
+	}
+	if cfg.CardActionHandler != nil {
+		if _, ok := cfg.FrameDecoder.(CardActionDecoder); !ok {
+			return nil, errors.New("lark ws connector: card action handler requires a CardActionDecoder")
+		}
 	}
 	if cfg.CredentialsProvider == nil {
 		return nil, errors.New("lark ws connector: CredentialsProvider is required")
@@ -352,6 +362,41 @@ func (c *WSLongConnConnector) Run(ctx context.Context, inst Installation, emit E
 			)
 		}
 
+		// Card callbacks are synchronous: Lark waits for the ACK payload and
+		// applies its returned card before releasing the client spinner.
+		if frame.HeaderValue(FrameHeaderTypeKey) == FrameHeaderTypeCard && c.cfg.CardActionHandler != nil {
+			decoder := c.cfg.FrameDecoder.(CardActionDecoder)
+			action, handled, decodeErr := decoder.DecodeCardAction(payload, inst)
+			if decodeErr != nil {
+				log.Warn("lark ws connector: card action decode failed", "err", decodeErr.Error())
+				if werr := c.writeFrame(&writeMu, conn, NewAckFrame(frame, true)); werr != nil {
+					return fmt.Errorf("write card decode ack: %w", werr)
+				}
+				continue
+			}
+			if !handled {
+				if werr := c.writeFrame(&writeMu, conn, NewAckFrame(frame, true)); werr != nil {
+					return fmt.Errorf("write card drop ack: %w", werr)
+				}
+				continue
+			}
+			response, handleErr := c.cfg.CardActionHandler.HandleCardAction(ctx, inst, action)
+			if handleErr != nil {
+				if werr := c.writeFrame(&writeMu, conn, NewAckFrame(frame, false)); werr != nil {
+					log.Warn("lark ws connector: card action nack failed", "err", werr.Error())
+				}
+				return fmt.Errorf("handle card action: %w", handleErr)
+			}
+			ack, encodeErr := NewAckFrameWithData(frame, true, response)
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if werr := c.writeFrame(&writeMu, conn, ack); werr != nil {
+				return fmt.Errorf("write card action ack: %w", werr)
+			}
+			continue
+		}
+
 		// Data frames: hand the (possibly reassembled) JSON payload to
 		// the decoder, emit if it resolved to a message, and ACK back.
 		msg, ok, derr := c.cfg.FrameDecoder.Decode(payload, inst)
@@ -501,6 +546,12 @@ type WSEndpoint struct {
 // outer binary Frame envelope is stripped by the connector.
 type FrameDecoder interface {
 	Decode(payload []byte, inst Installation) (msg InboundMessage, ok bool, err error)
+}
+
+// CardActionDecoder is the optional synchronous callback half of a decoder.
+// Lark marks these frames with type=card rather than type=event.
+type CardActionDecoder interface {
+	DecodeCardAction(payload []byte, inst Installation) (action CardAction, ok bool, err error)
 }
 
 // CredentialsProvider supplies the plaintext InstallationCredentials a

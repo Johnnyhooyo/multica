@@ -103,9 +103,10 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 		DesktopURL: "multica://issue/11111111-2222-3333-4444-555555555555?workspace=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee&comment=99999999-8888-7777-6666-555555555555",
 		StartTopic: true,
 		Card: notify.PushCardContent{
-			Title:     "[待你审核] Ship *this*",
-			Body:      "正文 **重点**\n- 核对结果\n[伪装链接](https://evil.example)\n<at id=all>所有人</at>",
-			ReplyHint: "审核通过可回复「审核通过」；需要修改请直接说明。",
+			Title:      "[待你审核] Ship *this*",
+			Body:       "正文 **重点**\n- 核对结果\n[伪装链接](https://evil.example)\n<at id=all>所有人</at>",
+			ReplyHint:  "审核通过可回复「审核通过」；需要修改请直接说明。",
+			CanApprove: true,
 		},
 	}
 
@@ -141,7 +142,7 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 	if err := json.Unmarshal([]byte(c.lastCard), &card); err != nil {
 		t.Fatalf("card json: %v", err)
 	}
-	if card.Schema != "2.0" || len(card.Body.Elements) != 3 {
+	if card.Schema != "2.0" || len(card.Body.Elements) != 4 {
 		t.Fatalf("card = %+v", card)
 	}
 	if card.Header.Title.Tag != "plain_text" || card.Header.Title.Content != ref.Card.Title {
@@ -163,7 +164,20 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 	if !strings.HasPrefix(hint, "**处理方式**\n") || !strings.Contains(hint, "审核通过") {
 		t.Errorf("card reply hint = %q", hint)
 	}
-	button := card.Body.Elements[2]
+	approve := card.Body.Elements[2]
+	if approve["element_id"] != "approve_review" || approve["type"] != "primary_filled" {
+		t.Fatalf("approve button = %#v", approve)
+	}
+	approveBehaviors, _ := approve["behaviors"].([]any)
+	if len(approveBehaviors) != 1 {
+		t.Fatalf("approve behaviors = %#v", approve["behaviors"])
+	}
+	callback := approveBehaviors[0].(map[string]any)
+	value := callback["value"].(map[string]any)
+	if callback["type"] != "callback" || value["action"] != reviewApprovalAction {
+		t.Errorf("approve callback = %#v", callback)
+	}
+	button := card.Body.Elements[3]
 	behaviors, _ := button["behaviors"].([]any)
 	if len(behaviors) != 1 {
 		t.Fatalf("button behaviors = %#v", button["behaviors"])
@@ -191,6 +205,37 @@ func TestDeliverDMSendsIssueCardAndStartsDedicatedTopic(t *testing.T) {
 	topic := c.textSends[0]
 	if topic.ChatID != "" || topic.ReplyTarget.MessageID != "om_root" || !topic.ReplyTarget.InThread {
 		t.Errorf("topic send = %+v", topic)
+	}
+}
+
+func TestIssuePushCardOmitsApprovalButtonWhenNotReviewable(t *testing.T) {
+	cardJSON, err := issuePushCard(notify.PushCardContent{
+		Title: "[任务受阻] Ship it",
+		Body:  "请补充信息后继续。",
+	}, "https://app.example.com/acme/issues/11111111-2222-3333-4444-555555555555", "")
+	if err != nil {
+		t.Fatalf("issuePushCard: %v", err)
+	}
+
+	var card struct {
+		Body struct {
+			Elements []map[string]any `json:"elements"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(cardJSON), &card); err != nil {
+		t.Fatalf("card json: %v", err)
+	}
+	for _, element := range card.Body.Elements {
+		if element["element_id"] == "approve_review" {
+			t.Fatalf("non-review card contains approval button: %#v", element)
+		}
+		behaviors, _ := element["behaviors"].([]any)
+		for _, behavior := range behaviors {
+			callback, _ := behavior.(map[string]any)
+			if callback["type"] == "callback" {
+				t.Fatalf("non-review card contains callback behavior: %#v", callback)
+			}
+		}
 	}
 }
 

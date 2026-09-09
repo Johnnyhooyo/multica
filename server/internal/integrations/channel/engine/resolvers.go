@@ -212,6 +212,15 @@ type PushReplyPoster interface {
 	PostPushReplyComment(ctx context.Context, push db.ChannelPushMessage, senderUserID pgtype.UUID, content string) (PushReplyResult, error)
 }
 
+// PushReviewApprover is the synchronous action seam used by platforms whose
+// cards can return an explicit approval click. It stays separate from
+// PushReplyPoster so ordinary channel adapters are not forced to support card
+// actions.
+type PushReviewApprover interface {
+	LookupPush(ctx context.Context, installationID pgtype.UUID, channelMessageID string) (db.ChannelPushMessage, bool, error)
+	ApprovePushReview(ctx context.Context, push db.ChannelPushMessage, senderUserID pgtype.UUID) (PushReplyResult, error)
+}
+
 // ChannelChatStartedEvent contains enough committed metadata for clients to
 // add or invalidate a channel-created Chat without changing their navigation.
 type ChannelChatStartedEvent struct {
@@ -458,8 +467,11 @@ type TaskEnqueuer interface {
 // something and is owed an answer. The error return is reserved for faults the
 // user cannot act on.
 type PushReplyResult struct {
-	Posted  bool
-	Message string
+	Posted          bool
+	Message         string
+	IssueTitle      string
+	ReviewFinalized bool
+	ApprovalApplied bool
 }
 
 // PushReplyPrecondition is the half of the reply verdict that reads no rows:

@@ -3,6 +3,7 @@ package lark
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -148,6 +149,30 @@ func pushDataFrame(conn *fakeWSConn, payload []byte, messageID string) {
 	conn.Push(f.Marshal())
 }
 
+func pushCardFrame(conn *fakeWSConn, payload []byte, messageID string) {
+	f := &Frame{
+		Method:  FrameMethodData,
+		Service: 7,
+		Headers: []FrameHeader{
+			{Key: FrameHeaderTypeKey, Value: FrameHeaderTypeCard},
+			{Key: FrameHeaderMessageIDKey, Value: messageID},
+		},
+		Payload: payload,
+	}
+	conn.Push(f.Marshal())
+}
+
+type recordingCardActionHandler struct {
+	action CardAction
+	calls  int
+}
+
+func (h *recordingCardActionHandler) HandleCardAction(_ context.Context, _ Installation, action CardAction) (CardActionResponse, error) {
+	h.calls++
+	h.action = action
+	return CardActionResponse{Toast: &CardActionToast{Type: "success", Content: "审核已通过"}}, nil
+}
+
 func TestWSConnectorRunReturnsOnCtxCancelEvenWhenReadIsBlocked(t *testing.T) {
 	t.Parallel()
 	conn := newFakeWSConn()
@@ -267,6 +292,78 @@ func TestWSConnectorEmitsDecodedFramesAndAcks(t *testing.T) {
 		if len(f.Payload) == 0 || !contains(string(f.Payload), `"code":200`) {
 			t.Errorf("ack[%d] payload missing code=200: %s", i, string(f.Payload))
 		}
+	}
+}
+
+func TestWSConnectorHandlesCardActionAndReturnsCallbackData(t *testing.T) {
+	t.Parallel()
+	conn := newFakeWSConn()
+	handler := &recordingCardActionHandler{}
+	c, err := NewWSLongConnConnector(WSConnectorConfig{
+		Dialer: &fakeWSDialer{conn: conn},
+		EndpointFetcher: EndpointFetcherFunc(func(context.Context, InstallationCredentials) (WSEndpoint, error) {
+			return WSEndpoint{URL: "wss://test/ignored", ServiceID: 7, PingInterval: time.Hour}, nil
+		}),
+		FrameDecoder:      NewLarkJSONFrameDecoder(),
+		CardActionHandler: handler,
+		CredentialsProvider: CredentialsProviderFunc(func(context.Context, Installation) (InstallationCredentials, error) {
+			return InstallationCredentials{AppID: "cli_app", AppSecret: "secret"}, nil
+		}),
+		PingInterval: time.Hour,
+		ReadDeadline: time.Second,
+		WriteTimeout: time.Second,
+		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewWSLongConnConnector: %v", err)
+	}
+	payload := []byte(`{
+		"schema":"2.0",
+		"header":{"event_id":"evt_click","event_type":"card.action.trigger","app_id":"cli_app"},
+		"event":{
+			"operator":{"open_id":"ou_member"},
+			"action":{"value":{"action":"approve_review"}},
+			"context":{"open_message_id":"om_push","open_chat_id":"oc_dm"}
+		}
+	}`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(ctx, Installation{AppID: "cli_app"}, func(context.Context, InboundMessage) (DispatchResult, error) {
+			t.Error("card callback must not enter the ordinary message emitter")
+			return DispatchResult{}, nil
+		})
+	}()
+	pushCardFrame(conn, payload, "callback-1")
+
+	deadline := time.After(2 * time.Second)
+	for len(conn.snapshot()) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("connector did not ACK card callback")
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	if handler.calls != 1 || handler.action.OpenMessageID != "om_push" || handler.action.OperatorOpenID != "ou_member" {
+		t.Fatalf("handler calls=%d action=%+v", handler.calls, handler.action)
+	}
+	written, err := UnmarshalFrame(conn.snapshot()[0])
+	if err != nil {
+		t.Fatalf("unmarshal ACK: %v", err)
+	}
+	var outer struct {
+		Code int    `json:"code"`
+		Data []byte `json:"data"`
+	}
+	if err := json.Unmarshal(written.Payload, &outer); err != nil {
+		t.Fatalf("decode ACK payload: %v", err)
+	}
+	if outer.Code != 200 || !strings.Contains(string(outer.Data), "审核已通过") {
+		t.Fatalf("ACK = code %d data %s", outer.Code, outer.Data)
 	}
 }
 

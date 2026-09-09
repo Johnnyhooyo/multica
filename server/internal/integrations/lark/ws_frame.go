@@ -1,6 +1,7 @@
 package lark
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -373,15 +374,38 @@ func NewPongFrame(serviceID int32) *Frame {
 // and nil Data slice both marshal to JSON null in stdlib encoding/json,
 // which is what the server expects to receive.
 func NewAckFrame(inbound *Frame, codeOK bool) *Frame {
+	frame, _ := NewAckFrameWithData(inbound, codeOK, nil)
+	return frame
+}
+
+// NewAckFrameWithData is the card-callback form of NewAckFrame. Lark's long
+// connection wraps the callback response JSON as a byte slice in the outer
+// response, matching the official SDK's Response.Data contract.
+func NewAckFrameWithData(inbound *Frame, codeOK bool, data any) (*Frame, error) {
 	code := 200
 	if !codeOK {
 		code = 500
 	}
-	payload := fmt.Sprintf(`{"code":%d,"headers":null,"data":null}`, code)
+	var dataBytes []byte
+	if data != nil {
+		var err error
+		dataBytes, err = json.Marshal(data)
+		if err != nil {
+			return nil, fmt.Errorf("encode lark callback response: %w", err)
+		}
+	}
+	payload, err := json.Marshal(struct {
+		StatusCode int               `json:"code"`
+		Headers    map[string]string `json:"headers"`
+		Data       []byte            `json:"data"`
+	}{StatusCode: code, Data: dataBytes})
+	if err != nil {
+		return nil, fmt.Errorf("encode lark ack: %w", err)
+	}
 	return &Frame{
 		Method:  inbound.Method,
 		Service: inbound.Service,
 		Headers: inbound.Headers,
-		Payload: []byte(payload),
-	}
+		Payload: payload,
+	}, nil
 }

@@ -95,6 +95,71 @@ func TestPostPushReplyCommentExplicitApprovalCompletesReview(t *testing.T) {
 	}
 }
 
+func TestApprovePushReviewIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	wsID := dbfx.Workspace(t, "Card Approval", "card-approval-"+uuid.NewString())
+	userID := dbfx.User(t, "Card Approver", "card-approval-"+uuid.NewString()+"@multica.ai")
+	dbfx.Member(t, wsID, userID, "member")
+	issueID := dbfx.Issue(t, "Approve from card", testutil.Cols{
+		"workspace_id": wsID, "status": "in_review",
+	})
+	dbfx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", issueID)
+
+	h := *testHandler
+	h.Bus = events.New()
+	push := db.ChannelPushMessage{
+		WorkspaceID:     parseUUID(wsID),
+		RecipientUserID: parseUUID(userID),
+		IssueID:         parseUUID(issueID),
+	}
+
+	first, err := h.ApprovePushReview(ctx, push, parseUUID(userID))
+	if err != nil {
+		t.Fatalf("first ApprovePushReview: %v", err)
+	}
+	if !first.Posted || !first.ReviewFinalized || !first.ApprovalApplied || first.IssueTitle != "Approve from card" {
+		t.Fatalf("first result = %+v", first)
+	}
+
+	second, err := h.ApprovePushReview(ctx, push, parseUUID(userID))
+	if err != nil {
+		t.Fatalf("second ApprovePushReview: %v", err)
+	}
+	if second.Posted || !second.ReviewFinalized || second.ApprovalApplied {
+		t.Fatalf("second result = %+v, want finalized no-op", second)
+	}
+	if comments := listPushReplyTestComments(t, issueID, wsID); len(comments) != 1 {
+		t.Fatalf("got %d comments after two clicks, want 1", len(comments))
+	}
+}
+
+func TestApprovePushReviewKeepsCardWhenIssueLeftReview(t *testing.T) {
+	ctx := context.Background()
+	wsID := dbfx.Workspace(t, "Stale Card Approval", "stale-card-approval-"+uuid.NewString())
+	userID := dbfx.User(t, "Stale Card Approver", "stale-card-approval-"+uuid.NewString()+"@multica.ai")
+	dbfx.Member(t, wsID, userID, "member")
+	issueID := dbfx.Issue(t, "Stale approval card", testutil.Cols{
+		"workspace_id": wsID, "status": "in_progress",
+	})
+	dbfx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", issueID)
+
+	push := db.ChannelPushMessage{
+		WorkspaceID:     parseUUID(wsID),
+		RecipientUserID: parseUUID(userID),
+		IssueID:         parseUUID(issueID),
+	}
+	result, err := testHandler.ApprovePushReview(ctx, push, parseUUID(userID))
+	if err != nil {
+		t.Fatalf("ApprovePushReview: %v", err)
+	}
+	if result.Posted || result.ReviewFinalized || result.ApprovalApplied {
+		t.Fatalf("result = %+v, want stale no-op", result)
+	}
+	if comments := listPushReplyTestComments(t, issueID, wsID); len(comments) != 0 {
+		t.Fatalf("got %d comments, want 0", len(comments))
+	}
+}
+
 func TestPostPushReplyCommentApprovalDoesNotCompleteANonReviewIssue(t *testing.T) {
 	ctx := context.Background()
 	wsID := dbfx.Workspace(t, "Push Reply Non Review", "push-reply-nonreview-"+uuid.NewString())

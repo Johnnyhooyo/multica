@@ -128,6 +128,25 @@ func issuePushCard(content notify.PushCardContent, webURL, desktopURL string) (s
 			"content": "**处理方式**\n" + escapeCardMarkdown(content.ReplyHint),
 		})
 	}
+	if content.CanApprove {
+		elements = append(elements, map[string]any{
+			"tag":        "button",
+			"element_id": "approve_review",
+			"type":       "primary_filled",
+			"text": map[string]any{
+				"tag":     "plain_text",
+				"content": "审核通过",
+			},
+			"behaviors": []any{
+				map[string]any{
+					"type": "callback",
+					"value": map[string]any{
+						"action": reviewApprovalAction,
+					},
+				},
+			},
+		})
+	}
 	elements = append(elements, map[string]any{
 		"tag":  "button",
 		"type": "primary",
@@ -146,7 +165,8 @@ func issuePushCard(content notify.PushCardContent, webURL, desktopURL string) (s
 	doc := map[string]any{
 		"schema": "2.0",
 		"config": map[string]any{
-			"summary": map[string]any{"content": content.Title},
+			"summary":      map[string]any{"content": content.Title},
+			"update_multi": true,
 		},
 		"header": map[string]any{
 			"template": "grey",

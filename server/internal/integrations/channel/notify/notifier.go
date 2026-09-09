@@ -766,8 +766,9 @@ func buildPush(item map[string]any, workspaceID, slug, effectiveStatus string, r
 		}
 	}
 	card := PushCardContent{
-		Title: "[" + label + "] " + title,
-		Body:  body,
+		Title:      "[" + label + "] " + title,
+		Body:       body,
+		CanApprove: replyable && typeStr == "status_changed" && effectiveStatus == issuestatus.InReview,
 	}
 	if replyable {
 		card.ReplyHint = hint

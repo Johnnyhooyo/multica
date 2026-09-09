@@ -334,6 +334,9 @@ func TestNotifierCarriesConfirmationContentAndCommentLink(t *testing.T) {
 	if a.lastRef.Card.ReplyHint != reviewReplyHint {
 		t.Errorf("Card.ReplyHint = %q", a.lastRef.Card.ReplyHint)
 	}
+	if !a.lastRef.Card.CanApprove {
+		t.Error("Card.CanApprove = false, want true for an actionable in_review push")
+	}
 }
 
 // A platform that cannot carry a reply back must not be handed a message
@@ -353,6 +356,9 @@ func TestNotifierDoesNotPromiseRepliesAPlatformCannotCarry(t *testing.T) {
 	}
 	if a.lastRef.StartTopic {
 		t.Error("StartTopic = true for a platform that cannot accept replies")
+	}
+	if a.lastRef.Card.CanApprove {
+		t.Error("Card.CanApprove = true for a platform that cannot return the action")
 	}
 	if len(q.created) != 0 {
 		t.Errorf("ledger rows = %d, want 0", len(q.created))
@@ -467,6 +473,9 @@ func TestNotifierDeliversABlockedStatusWithActionableCopy(t *testing.T) {
 	}
 	if len(q.created) != 1 {
 		t.Fatalf("ledger rows = %d, want 1 for a replyable blocked push", len(q.created))
+	}
+	if a.lastRef.Card.CanApprove {
+		t.Error("Card.CanApprove = true for a blocked push")
 	}
 }
 

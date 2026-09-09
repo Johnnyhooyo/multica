@@ -3,6 +3,7 @@ package lark
 import (
 	"bytes"
 	"encoding/hex"
+	"encoding/json"
 	"testing"
 )
 
@@ -95,7 +96,7 @@ func TestFrameMarshalIsSDKByteCompatible(t *testing.T) {
 			expected: "08001000182a20002a0c0a04747970651204706f6e6732003a004a00",
 		},
 		{
-			name:  "ack_data_frame",
+			name: "ack_data_frame",
 			frame: NewAckFrame(&Frame{
 				Method:  FrameMethodData,
 				Service: 7,
@@ -220,6 +221,34 @@ func TestNewAckFrameReusesInboundHeaders(t *testing.T) {
 	nack := NewAckFrame(inbound, false)
 	if !bytes.Contains(nack.Payload, []byte(`"code":500`)) {
 		t.Errorf("nack payload missing code=500: %s", string(nack.Payload))
+	}
+}
+
+func TestNewAckFrameWithDataEncodesCardCallbackResponse(t *testing.T) {
+	t.Parallel()
+	inbound := &Frame{
+		Method:  FrameMethodData,
+		Service: 7,
+		Headers: []FrameHeader{
+			{Key: FrameHeaderTypeKey, Value: FrameHeaderTypeCard},
+			{Key: FrameHeaderMessageIDKey, Value: "callback-42"},
+		},
+	}
+	ack, err := NewAckFrameWithData(inbound, true, CardActionResponse{
+		Toast: &CardActionToast{Type: "success", Content: "审核已通过"},
+	})
+	if err != nil {
+		t.Fatalf("NewAckFrameWithData: %v", err)
+	}
+	var outer struct {
+		Code int    `json:"code"`
+		Data []byte `json:"data"`
+	}
+	if err := json.Unmarshal(ack.Payload, &outer); err != nil {
+		t.Fatalf("outer response: %v", err)
+	}
+	if outer.Code != 200 || !bytes.Contains(outer.Data, []byte(`"content":"审核已通过"`)) {
+		t.Fatalf("outer = code %d data %s", outer.Code, outer.Data)
 	}
 }
 

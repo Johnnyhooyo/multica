@@ -59,6 +59,10 @@ type PushCardContent struct {
 	Title     string
 	Body      string
 	ReplyHint string
+	// CanApprove marks an in-review notification whose recipient may finish
+	// the review from a platform-native card action. Adapters without card
+	// callbacks ignore it and keep their existing reply/deep-link behavior.
+	CanApprove bool
 }
 
 // PushRef identifies the inbox row a push came from.

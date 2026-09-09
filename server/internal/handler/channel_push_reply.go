@@ -33,6 +33,29 @@ func (h *Handler) PostPushReplyComment(
 	senderUserID pgtype.UUID,
 	content string,
 ) (engine.PushReplyResult, error) {
+	return h.postPushReply(ctx, push, senderUserID, content, false)
+}
+
+// ApprovePushReview applies the same durable review decision as an exact
+// "审核通过" reply, but makes repeated card clicks idempotent. A task that is
+// already done returns a finalized result without writing another comment or
+// waking the agent again; a task that moved elsewhere keeps the action visible
+// so the member can inspect its current state.
+func (h *Handler) ApprovePushReview(
+	ctx context.Context,
+	push db.ChannelPushMessage,
+	senderUserID pgtype.UUID,
+) (engine.PushReplyResult, error) {
+	return h.postPushReply(ctx, push, senderUserID, "审核通过", true)
+}
+
+func (h *Handler) postPushReply(
+	ctx context.Context,
+	push db.ChannelPushMessage,
+	senderUserID pgtype.UUID,
+	content string,
+	cardApproval bool,
+) (engine.PushReplyResult, error) {
 	content, denial, ok := engine.PushReplyPrecondition(
 		uuidToString(push.RecipientUserID), uuidToString(senderUserID), content)
 	if !ok {
@@ -68,6 +91,7 @@ func (h *Handler) PostPushReplyComment(
 		}
 		return engine.PushReplyResult{}, err
 	}
+	result := engine.PushReplyResult{IssueTitle: issue.Title}
 
 	createParams := db.CreateCommentParams{
 		ID:          dbid.NewV7(),
@@ -100,11 +124,21 @@ func (h *Handler) PostPushReplyComment(
 			return engine.PushReplyResult{}, fmt.Errorf("lock issue for push reply approval: %w", lockErr)
 		}
 		issue = current
+		effectiveStatus := issuestatus.Effective(ctx, qtx, current.WorkspaceID, current.Status)
+		if cardApproval && effectiveStatus != issuestatus.InReview {
+			if effectiveStatus == issuestatus.Done {
+				result.ReviewFinalized = true
+				result.Message = "任务已经是 done，无需重复审核。"
+				return result, nil
+			}
+			result.Message = "任务已不在待审核状态，请打开 Multica 查看。"
+			return result, nil
+		}
 		created, err = qtx.CreateComment(ctx, createParams)
 		if err != nil {
 			return engine.PushReplyResult{}, err
 		}
-		if issuestatus.Effective(ctx, qtx, current.WorkspaceID, current.Status) == issuestatus.InReview {
+		if effectiveStatus == issuestatus.InReview {
 			updated, updateErr := qtx.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
 				ID: current.ID, Status: issuestatus.Done, WorkspaceID: current.WorkspaceID,
 			})
@@ -170,9 +204,15 @@ func (h *Handler) PostPushReplyComment(
 		"channel_type", push.ChannelType,
 	)
 	if approvedIssue != nil {
-		return engine.PushReplyResult{Posted: true, Message: "审核已通过，任务已流转为 done，Multica 会继续处理后续工作。"}, nil
+		result.Posted = true
+		result.ReviewFinalized = true
+		result.ApprovalApplied = true
+		result.Message = "审核已通过，任务已流转为 done，Multica 会继续处理后续工作。"
+		return result, nil
 	}
-	return engine.PushReplyResult{Posted: true, Message: "已记录审核意见，Multica 会结合任务上下文继续处理。"}, nil
+	result.Posted = true
+	result.Message = "已记录审核意见，Multica 会结合任务上下文继续处理。"
+	return result, nil
 }
 
 func isExplicitReviewApproval(content string) bool {
@@ -238,3 +278,4 @@ func (h *Handler) LookupPush(ctx context.Context, installationID pgtype.UUID, ch
 // Compile-time assertion: a future signature drift on either side fails the
 // build rather than silently disabling the feature.
 var _ engine.PushReplyPoster = (*Handler)(nil)
+var _ engine.PushReviewApprover = (*Handler)(nil)
