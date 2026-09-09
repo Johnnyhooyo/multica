@@ -136,7 +136,7 @@ func (n *Notifier) HandleCommentCreated(e events.Event) {
 	if !ok {
 		return
 	}
-	comment, ok := payload["comment"].(map[string]any)
+	comment, ok := commentEventFields(payload["comment"])
 	if !ok || itemString(comment, "author_type") != "agent" {
 		return
 	}
@@ -190,6 +190,25 @@ func (n *Notifier) HandleCommentCreated(e events.Event) {
 		n.releaseAgentReply(push, commentID)
 		n.logger.WarnContext(ctx, "notify: push topic reply failed", "error", err, "channel_type", push.ChannelType, "comment_id", util.UUIDToString(commentID))
 	}
+}
+
+// commentEventFields normalizes the two in-process EventCommentCreated shapes.
+// TaskService publishes a map, while the HTTP CreateComment handler publishes
+// its concrete response struct. The event bus passes Go values directly, so the
+// latter does not become a map until the WebSocket layer serializes it.
+func commentEventFields(value any) (map[string]any, bool) {
+	if fields, ok := value.(map[string]any); ok {
+		return fields, true
+	}
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, false
+	}
+	return fields, true
 }
 
 func (n *Notifier) releaseAgentReply(push db.ChannelPushMessage, commentID pgtype.UUID) {

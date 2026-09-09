@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/google/uuid"
@@ -28,6 +29,8 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
+	h := *testHandler
+	h.Bus = events.New()
 
 	wsID := dbfx.Workspace(t, "Push Round Trip", "push-roundtrip-"+uuid.NewString())
 	userID := dbfx.User(t, "Push Round Trip Recipient", "push-roundtrip-"+uuid.NewString()+"@multica.ai")
@@ -64,7 +67,7 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 
 	// --- push half -------------------------------------------------------
 	fake := &recordingDeliverer{messageID: "om_push_1"}
-	n := notify.New(testHandler.Queries, nil, nil)
+	n := notify.New(h.Queries, nil, nil)
 	n.Register(map[string]notify.DMDeliverer{"feishu": fake})
 
 	n.HandleInboxNew(inboxNewEvent(t, wsID, userID, issueID, "status_changed", "in_review"))
@@ -74,7 +77,7 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 	}
 
 	// --- the ledger row is the hinge -------------------------------------
-	push, ok, err := testHandler.LookupPush(ctx, parseUUID(installationID), "om_push_1")
+	push, ok, err := h.LookupPush(ctx, parseUUID(installationID), "om_push_1")
 	if err != nil {
 		t.Fatalf("LookupPush: %v", err)
 	}
@@ -86,14 +89,14 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 	}
 
 	// --- reply half ------------------------------------------------------
-	res, err := testHandler.PostPushReplyComment(ctx, push, parseUUID(userID), "确认审核")
+	res, err := h.PostPushReplyComment(ctx, push, parseUUID(userID), "确认审核")
 	if err != nil {
 		t.Fatalf("PostPushReplyComment: %v", err)
 	}
 	if !res.Posted {
 		t.Fatalf("Posted = false: %q", res.Message)
 	}
-	approved, err := testHandler.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+	approved, err := h.Queries.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
 		ID: parseUUID(issueID), WorkspaceID: parseUUID(wsID),
 	})
 	if err != nil {
@@ -106,7 +109,7 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 	// --- the wake --------------------------------------------------------
 	// The comment trigger is the mechanism the whole design leans on; assert
 	// it fired rather than trusting the comment row alone.
-	tasks, err := testHandler.Queries.ListTasksByIssue(ctx, parseUUID(issueID))
+	tasks, err := h.Queries.ListTasksByIssue(ctx, parseUUID(issueID))
 	if err != nil {
 		t.Fatalf("ListTasksByIssue: %v", err)
 	}
@@ -119,29 +122,32 @@ func TestLarkPushReplyRoundTrip(t *testing.T) {
 	if len(comments) != 1 {
 		t.Fatalf("member comments = %d, want 1", len(comments))
 	}
-	agentCommentID := uuid.NewString()
 	sourceTaskID := uuidToString(tasks[0].ID)
-	n.HandleCommentCreated(events.Event{
-		Type: protocol.EventCommentCreated, WorkspaceID: wsID,
-		ActorType: "agent", ActorID: agentID,
-		Payload: map[string]any{"comment": map[string]any{
-			"id": agentCommentID, "issue_id": issueID, "author_type": "agent",
-			"content": "我已按你的意见更新。", "source_task_id": &sourceTaskID,
-		}},
+	var agentCommentEvent events.Event
+	h.Bus.Subscribe(protocol.EventCommentCreated, func(event events.Event) {
+		if event.ActorType == "agent" {
+			agentCommentEvent = event
+		}
 	})
+	req := withURLParam(newRequest(http.MethodPost, "/api/issues/"+issueID+"/comments", map[string]any{
+		"content":   "我已按你的意见更新。",
+		"parent_id": uuidToString(comments[0].ID),
+	}), "id", issueID)
+	req.Header.Set("X-User-ID", userID)
+	req.Header.Set("X-Workspace-ID", wsID)
+	req.Header.Set("X-Agent-ID", agentID)
+	req.Header.Set("X-Task-ID", sourceTaskID)
+	testutil.Call(t, h.CreateComment, req).Want(http.StatusCreated)
+	if agentCommentEvent.Type == "" {
+		t.Fatal("agent comment event was not published")
+	}
+	n.HandleCommentCreated(agentCommentEvent)
 	if fake.topicCalls != 1 || fake.topicRoot != "om_push_1" {
 		t.Fatalf("agent reply route = calls %d root %q, want 1/om_push_1", fake.topicCalls, fake.topicRoot)
 	}
 	// Replaying the same event is a no-op because the claim is persisted on
 	// channel_push_message before the send.
-	n.HandleCommentCreated(events.Event{
-		Type: protocol.EventCommentCreated, WorkspaceID: wsID,
-		ActorType: "agent", ActorID: agentID,
-		Payload: map[string]any{"comment": map[string]any{
-			"id": agentCommentID, "issue_id": issueID, "author_type": "agent",
-			"content": "我已按你的意见更新。", "source_task_id": &sourceTaskID,
-		}},
-	})
+	n.HandleCommentCreated(agentCommentEvent)
 	if fake.topicCalls != 1 {
 		t.Fatalf("replayed agent comment produced %d topic replies, want 1", fake.topicCalls)
 	}

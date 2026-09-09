@@ -166,6 +166,30 @@ func agentCommentEvent() events.Event {
 	}
 }
 
+// handlerCommentPayload mirrors the concrete CommentResponse value published
+// by handler.CreateComment. The in-process event bus does not JSON-round-trip
+// payloads, so consumers must accept this struct shape as well as the map shape
+// published by TaskService.createAgentComment.
+type handlerCommentPayload struct {
+	ID           string  `json:"id"`
+	IssueID      string  `json:"issue_id"`
+	AuthorType   string  `json:"author_type"`
+	Content      string  `json:"content"`
+	SourceTaskID *string `json:"source_task_id,omitempty"`
+}
+
+func agentCommentStructEvent() events.Event {
+	sourceTaskID := "66666666-6666-6666-6666-666666666666"
+	return events.Event{
+		Type: protocol.EventCommentCreated, WorkspaceID: testWorkspace,
+		ActorType: "agent", ActorID: "77777777-7777-7777-7777-777777777777",
+		Payload: map[string]any{"comment": handlerCommentPayload{
+			ID: "88888888-8888-8888-8888-888888888888", IssueID: testIssue,
+			AuthorType: "agent", Content: "我已按你的意见更新。", SourceTaskID: &sourceTaskID,
+		}},
+	}
+}
+
 func TestAgentCommentReturnsToClaimedPushTopic(t *testing.T) {
 	q := &fakeQueries{claimedReply: db.ChannelPushMessage{
 		InstallationID: mustUUID(t, testInstall), ChannelType: "lark", ChannelMessageID: "om_root",
@@ -178,6 +202,18 @@ func TestAgentCommentReturnsToClaimedPushTopic(t *testing.T) {
 	}
 	if a.topicText != "先确认第一件事：目标用户是谁？" {
 		t.Fatalf("topic text = %q", a.topicText)
+	}
+}
+
+func TestAgentCommentStructPayloadReturnsToClaimedPushTopic(t *testing.T) {
+	q := &fakeQueries{claimedReply: db.ChannelPushMessage{
+		InstallationID: mustUUID(t, testInstall), ChannelType: "lark", ChannelMessageID: "om_root",
+	}}
+	a := &fakeAdapter{}
+	n := newTestNotifier(t, q, a)
+	n.HandleCommentCreated(agentCommentStructEvent())
+	if a.topicCalls != 1 || a.topicRoot != "om_root" {
+		t.Fatalf("topic delivery = calls %d root %q, want 1/om_root", a.topicCalls, a.topicRoot)
 	}
 }
 
