@@ -107,6 +107,15 @@ func (d *dmDeliverer) DeliverTopicReply(ctx context.Context, installationID pgty
 }
 
 func issuePushCard(content notify.PushCardContent, webURL, desktopURL string) (string, error) {
+	doc := issuePushCardData(content, webURL, desktopURL)
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		return "", fmt.Errorf("lark: encode issue push card: %w", err)
+	}
+	return string(raw), nil
+}
+
+func issuePushCardData(content notify.PushCardContent, webURL, desktopURL string) map[string]any {
 	defaultURL := webURL
 	if defaultURL == "" {
 		defaultURL = desktopURL
@@ -162,7 +171,7 @@ func issuePushCard(content notify.PushCardContent, webURL, desktopURL string) (s
 			},
 		},
 	})
-	doc := map[string]any{
+	return map[string]any{
 		"schema": "2.0",
 		"config": map[string]any{
 			"summary":      map[string]any{"content": content.Title},
@@ -179,11 +188,6 @@ func issuePushCard(content notify.PushCardContent, webURL, desktopURL string) (s
 			"elements": elements,
 		},
 	}
-	raw, err := json.Marshal(doc)
-	if err != nil {
-		return "", fmt.Errorf("lark: encode issue push card: %w", err)
-	}
-	return string(raw), nil
 }
 
 // desktopBridgeURL keeps Lark's card URL on HTTP(S). Lark Desktop ignores

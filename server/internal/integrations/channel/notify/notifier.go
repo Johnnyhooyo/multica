@@ -779,6 +779,37 @@ func buildPush(item map[string]any, workspaceID, slug, effectiveStatus string, r
 	}
 }
 
+// RebuildReviewPushRef recreates the semantic card fields and destinations of
+// a delivered review notification from its durable inbox row. Card callbacks
+// use this to return the original card with only the approval affordance
+// removed; keeping the reconstruction here prevents the Lark adapter from
+// duplicating notification copy and deep-link rules.
+func RebuildReviewPushRef(item db.InboxItem, workspaceSlug string) PushRef {
+	workspaceID := util.UUIDToString(item.WorkspaceID)
+	itemMap := map[string]any{
+		"id":             util.UUIDToString(item.ID),
+		"workspace_id":   workspaceID,
+		"recipient_type": item.RecipientType,
+		"recipient_id":   util.UUIDToString(item.RecipientID),
+		"type":           item.Type,
+		"issue_id":       util.UUIDToString(item.IssueID),
+		"title":          item.Title,
+		"details":        json.RawMessage(item.Details),
+	}
+	if item.Body.Valid {
+		itemMap["body"] = item.Body.String
+	}
+	rendered := buildPush(itemMap, workspaceID, workspaceSlug, issuestatus.InReview, true)
+	return PushRef{
+		InboxItemID:     util.UUIDToString(item.ID),
+		RecipientUserID: util.UUIDToString(item.RecipientID),
+		Card:            rendered.Card,
+		WebURL:          rendered.Link,
+		DesktopURL:      pushDesktopLink(itemMap, workspaceID),
+		StartTopic:      item.IssueID.Valid,
+	}
+}
+
 // Text renders the platform-neutral fallback. Per-platform escaping and
 // length budgets belong to the adapter, which applies them to this output
 // (see FitPush).

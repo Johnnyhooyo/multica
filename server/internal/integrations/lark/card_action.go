@@ -7,9 +7,12 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/multica-ai/multica/server/internal/integrations/channel/engine"
+	"github.com/multica-ai/multica/server/internal/integrations/channel/notify"
 	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 const reviewApprovalAction = "approve_review"
@@ -52,6 +55,8 @@ type CardActionCard struct {
 type cardActionStore interface {
 	GetLarkInstallationByAppID(ctx context.Context, appID string) (Installation, error)
 	GetLarkUserBindingByOpenID(ctx context.Context, arg GetUserBindingByOpenIDParams) (UserBinding, error)
+	GetInboxItemInWorkspace(ctx context.Context, arg db.GetInboxItemInWorkspaceParams) (db.InboxItem, error)
+	GetWorkspace(ctx context.Context, id pgtype.UUID) (db.Workspace, error)
 }
 
 type reviewCardActionHandler struct {
@@ -104,6 +109,27 @@ func (h *reviewCardActionHandler) HandleCardAction(ctx context.Context, inst Ins
 	if err != nil {
 		return CardActionResponse{}, fmt.Errorf("resolve card action operator: %w", err)
 	}
+	item, err := h.store.GetInboxItemInWorkspace(ctx, db.GetInboxItemInWorkspaceParams{
+		ID: push.InboxItemID, WorkspaceID: push.WorkspaceID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return cardActionError("原审核卡片已失效，请打开 Multica 处理。"), nil
+	}
+	if err != nil {
+		return CardActionResponse{}, fmt.Errorf("load review card inbox item: %w", err)
+	}
+	if item.RecipientID != push.RecipientUserID || item.IssueID != push.IssueID {
+		return CardActionResponse{}, errors.New("review card inbox item does not match push attribution")
+	}
+	workspace, err := h.store.GetWorkspace(ctx, push.WorkspaceID)
+	if err != nil {
+		return CardActionResponse{}, fmt.Errorf("load review card workspace: %w", err)
+	}
+	preserved := notify.RebuildReviewPushRef(item, workspace.Slug)
+	if preserved.Card.Title == "" || preserved.WebURL == "" || preserved.DesktopURL == "" {
+		return CardActionResponse{}, errors.New("review card cannot be reconstructed")
+	}
+	preserved.Card.CanApprove = false
 
 	result, err := h.approver.ApprovePushReview(ctx, push, binding.MulticaUserID)
 	if err != nil {
@@ -113,15 +139,11 @@ func (h *reviewCardActionHandler) HandleCardAction(ctx context.Context, inst Ins
 		return cardActionError(result.Message), nil
 	}
 
-	statusLabel := "审核已通过"
-	if !result.ApprovalApplied {
-		statusLabel = "任务已完成"
-	}
 	return CardActionResponse{
 		Toast: &CardActionToast{Type: "success", Content: result.Message},
 		Card: &CardActionCard{
 			Type: "raw",
-			Data: completedReviewCard(statusLabel, result.IssueTitle, result.Message),
+			Data: issuePushCardData(preserved.Card, preserved.WebURL, preserved.DesktopURL),
 		},
 	}, nil
 }
@@ -131,38 +153,6 @@ func cardActionError(message string) CardActionResponse {
 		message = "审核操作未完成，请打开 Multica 查看。"
 	}
 	return CardActionResponse{Toast: &CardActionToast{Type: "error", Content: message}}
-}
-
-// completedReviewCard intentionally contains no callback button. Returning it
-// synchronously is what removes the approval affordance from the message the
-// member clicked, while keeping an explicit audit state visible in the chat.
-func completedReviewCard(statusLabel, issueTitle, message string) map[string]any {
-	title := "[" + statusLabel + "]"
-	if issueTitle != "" {
-		title += " " + issueTitle
-	}
-	return map[string]any{
-		"schema": "2.0",
-		"config": map[string]any{
-			"summary":      map[string]any{"content": title},
-			"update_multi": true,
-		},
-		"header": map[string]any{
-			"template": "green",
-			"title": map[string]any{
-				"tag":     "plain_text",
-				"content": title,
-			},
-		},
-		"body": map[string]any{
-			"elements": []any{
-				map[string]any{
-					"tag":     "markdown",
-					"content": escapeCardMarkdown(message),
-				},
-			},
-		},
-	}
 }
 
 // DecodeCardAction parses the callback envelope carried by a long-connection
