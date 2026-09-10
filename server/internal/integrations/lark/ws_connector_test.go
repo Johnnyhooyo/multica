@@ -149,19 +149,6 @@ func pushDataFrame(conn *fakeWSConn, payload []byte, messageID string) {
 	conn.Push(f.Marshal())
 }
 
-func pushCardFrame(conn *fakeWSConn, payload []byte, messageID string) {
-	f := &Frame{
-		Method:  FrameMethodData,
-		Service: 7,
-		Headers: []FrameHeader{
-			{Key: FrameHeaderTypeKey, Value: FrameHeaderTypeCard},
-			{Key: FrameHeaderMessageIDKey, Value: messageID},
-		},
-		Payload: payload,
-	}
-	conn.Push(f.Marshal())
-}
-
 type recordingCardActionHandler struct {
 	action CardAction
 	calls  int
@@ -295,7 +282,7 @@ func TestWSConnectorEmitsDecodedFramesAndAcks(t *testing.T) {
 	}
 }
 
-func TestWSConnectorHandlesCardActionAndReturnsCallbackData(t *testing.T) {
+func TestWSConnectorHandlesP2CardActionFromEventFrameAndReturnsCallbackData(t *testing.T) {
 	t.Parallel()
 	conn := newFakeWSConn()
 	handler := &recordingCardActionHandler{}
@@ -335,7 +322,7 @@ func TestWSConnectorHandlesCardActionAndReturnsCallbackData(t *testing.T) {
 			return DispatchResult{}, nil
 		})
 	}()
-	pushCardFrame(conn, payload, "callback-1")
+	pushDataFrame(conn, payload, "callback-1")
 
 	deadline := time.After(2 * time.Second)
 	for len(conn.snapshot()) == 0 {
