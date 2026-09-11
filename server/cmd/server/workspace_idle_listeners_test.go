@@ -1,13 +1,13 @@
 package main
 
 import (
-	"strings"
-	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -35,45 +35,43 @@ func newWorkspaceIdleFixture(t *testing.T) *workspaceIdleFixture {
 	agentID := fx.Agent(t, "Idle Test Agent", runtimeID)
 
 	bus := events.New()
-	registerWorkspaceIdleListeners(bus, testPool)
+	taskSvc := service.NewTaskService(db.New(testPool), testPool, nil, bus)
+	registerWorkspaceIdleListeners(bus, testPool, taskSvc)
 	return &workspaceIdleFixture{
 		fx: fx, bus: bus, workspaceID: workspaceID, ownerID: ownerID,
 		runtimeID: runtimeID, agentID: agentID,
 	}
 }
 
-func (f *workspaceIdleFixture) member(t *testing.T, role string) string {
-	t.Helper()
-	seed := uuid.NewString()
-	userID := f.fx.User(t, "Idle Recipient", "idle-recipient-"+seed+"@multica.test")
-	f.fx.Member(t, f.workspaceID, userID, role)
-	return userID
-}
-
-func (f *workspaceIdleFixture) issue(t *testing.T, creatorType, creatorID, status string) string {
+func (f *workspaceIdleFixture) issue(t *testing.T, assigneeType, assigneeID, status string) string {
 	t.Helper()
 	return f.fx.Issue(t, "Idle workflow issue", testutil.Cols{
-		"workspace_id": f.workspaceID,
-		"creator_type": creatorType,
-		"creator_id":   creatorID,
-		"status":       status,
+		"workspace_id":  f.workspaceID,
+		"creator_type":  "member",
+		"creator_id":    f.ownerID,
+		"assignee_type": assigneeType,
+		"assignee_id":   assigneeID,
+		"status":        status,
 	})
 }
 
-func (f *workspaceIdleFixture) activeTask(t *testing.T, issueID string) string {
+func (f *workspaceIdleFixture) task(t *testing.T, issueID, status string, extra testutil.Cols) string {
 	t.Helper()
-	taskID := f.fx.Task(t, f.agentID, testutil.Cols{
-		"runtime_id": f.runtimeID,
-		"issue_id":   issueID,
-		"status":     "running",
-		"started_at": testutil.Raw("now()"),
-	})
-	f.bus.Publish(events.Event{
-		Type:        protocol.EventTaskRunning,
-		WorkspaceID: f.workspaceID,
-		Payload:     map[string]any{"task_id": taskID, "issue_id": issueID},
-	})
-	return taskID
+	cols := testutil.Cols{
+		"runtime_id":          f.runtimeID,
+		"issue_id":            issueID,
+		"status":              status,
+		"originator_user_id":  f.ownerID,
+		"accountable_user_id": f.ownerID,
+		"originator_source":   "direct_human",
+	}
+	if status == "running" {
+		cols["started_at"] = testutil.Raw("now()")
+	}
+	for key, value := range extra {
+		cols[key] = value
+	}
+	return f.fx.Task(t, f.agentID, cols)
 }
 
 func (f *workspaceIdleFixture) finishTask(t *testing.T, taskID, eventType string, retryPending bool) {
@@ -88,6 +86,7 @@ func (f *workspaceIdleFixture) finishTask(t *testing.T, taskID, eventType string
 	f.bus.Publish(events.Event{
 		Type:        eventType,
 		WorkspaceID: f.workspaceID,
+		TaskID:      taskID,
 		Payload: map[string]any{
 			"task_id":       taskID,
 			"issue_id":      f.taskIssueID(t, taskID),
@@ -103,149 +102,70 @@ func (f *workspaceIdleFixture) taskIssueID(t *testing.T, taskID string) string {
 	return issueID
 }
 
-func (f *workspaceIdleFixture) inboxCount(t *testing.T, recipientID string) int {
+func (f *workspaceIdleFixture) reconciliationTasks(t *testing.T, issueID string) int {
+	t.Helper()
+	return f.fx.Count(t, `
+		SELECT count(*) FROM agent_task_queue
+		WHERE issue_id = $1 AND trigger_evidence_kind = 'workflow_reconcile'
+	`, issueID)
+}
+
+func (f *workspaceIdleFixture) inboxCount(t *testing.T) int {
 	t.Helper()
 	return f.fx.Count(t, `
 		SELECT count(*) FROM inbox_item
 		WHERE workspace_id = $1 AND recipient_id = $2 AND type = 'workspace_idle'
-	`, f.workspaceID, recipientID)
+	`, f.workspaceID, f.ownerID)
 }
 
-func TestWorkspaceIdleNotifiesManagersWhenNoIssueIsInProgress(t *testing.T) {
+func TestWorkflowReconcileAutomaticallyContinuesStalledAgentIssue(t *testing.T) {
 	f := newWorkspaceIdleFixture(t)
-	adminID := f.member(t, "admin")
-	issueID := f.issue(t, "member", f.ownerID, "done")
-	taskID := f.activeTask(t, issueID)
+	issueID := f.issue(t, "agent", f.agentID, "in_progress")
+	taskID := f.task(t, issueID, "running", nil)
 
 	f.finishTask(t, taskID, protocol.EventTaskCompleted, false)
 
-	if got := f.inboxCount(t, f.ownerID); got != 1 {
-		t.Fatalf("owner workspace_idle inbox rows = %d, want 1", got)
+	if got := f.reconciliationTasks(t, issueID); got != 1 {
+		t.Fatalf("workflow reconciliation tasks = %d, want 1", got)
 	}
-	if got := f.inboxCount(t, adminID); got != 1 {
-		t.Fatalf("admin workspace_idle inbox rows = %d, want 1", got)
+	if got := f.inboxCount(t); got != 0 {
+		t.Fatalf("attention inbox rows = %d, want 0 while automatic continuation is queued", got)
 	}
-}
-
-func TestWorkspaceIdleNotifiesInProgressCreatorsAndDelegatorsOnce(t *testing.T) {
-	f := newWorkspaceIdleFixture(t)
-	creatorID := f.member(t, "member")
-	delegatorID := f.member(t, "member")
-	creatorIssueID := f.issue(t, "member", creatorID, "in_progress")
-	delegatedIssueID := f.issue(t, "agent", f.agentID, "in_progress")
-	f.fx.InsertNoID(t, "issue_subscriber", testutil.Cols{
-		"issue_id":  delegatedIssueID,
-		"user_type": "member",
-		"user_id":   delegatorID,
-		"reason":    "delegated",
-	}, "issue_id = $1 AND user_type = 'member' AND user_id = $2", delegatedIssueID, delegatorID)
-	// The same member appearing through both routes must still receive one row.
-	f.fx.InsertNoID(t, "issue_subscriber", testutil.Cols{
-		"issue_id":  delegatedIssueID,
-		"user_type": "member",
-		"user_id":   creatorID,
-		"reason":    "delegated",
-	}, "issue_id = $1 AND user_type = 'member' AND user_id = $2", delegatedIssueID, creatorID)
-	taskID := f.activeTask(t, creatorIssueID)
-
-	f.finishTask(t, taskID, protocol.EventTaskCompleted, false)
-
-	if got := f.inboxCount(t, creatorID); got != 1 {
-		t.Fatalf("creator workspace_idle inbox rows = %d, want 1", got)
-	}
-	if got := f.inboxCount(t, delegatorID); got != 1 {
-		t.Fatalf("delegator workspace_idle inbox rows = %d, want 1", got)
-	}
-	if got := f.inboxCount(t, f.ownerID); got != 0 {
-		t.Fatalf("unrelated owner workspace_idle inbox rows = %d, want 0", got)
-	}
-
-	var body string
+	var originatorID, accountableID, evidenceRef, handoffNote string
 	f.fx.QueryRow(t, `
-		SELECT body FROM inbox_item
-		WHERE workspace_id = $1 AND recipient_id = $2 AND type = 'workspace_idle'
-	`, f.workspaceID, creatorID).Scan(&body)
-	if !strings.Contains(body, "2 个 in_progress 任务") {
-		t.Errorf("body = %q, want the in-progress issue count", body)
+		SELECT originator_user_id, accountable_user_id, trigger_evidence_ref_id, handoff_note
+		FROM agent_task_queue
+		WHERE issue_id = $1 AND trigger_evidence_kind = 'workflow_reconcile'
+	`, issueID).Scan(&originatorID, &accountableID, &evidenceRef, &handoffNote)
+	if originatorID != f.ownerID || accountableID != f.ownerID {
+		t.Fatalf("reconciliation attribution = originator %s accountable %s, want %s", originatorID, accountableID, f.ownerID)
+	}
+	if evidenceRef != taskID {
+		t.Fatalf("reconciliation evidence = %s, want source task %s", evidenceRef, taskID)
+	}
+	if handoffNote == "" {
+		t.Fatal("reconciliation task has no convergence instruction")
 	}
 }
 
-func TestWorkspaceIdleDoesNotNotifyWhileAnotherTaskIsActive(t *testing.T) {
+func TestWorkflowReconcileTreatsDeferredTaskAsPlannedWork(t *testing.T) {
 	f := newWorkspaceIdleFixture(t)
-	issueID := f.issue(t, "member", f.ownerID, "done")
-	finishedTaskID := f.activeTask(t, issueID)
-	f.activeTask(t, issueID)
+	issueID := f.issue(t, "agent", f.agentID, "in_progress")
+	sourceID := f.task(t, issueID, "running", nil)
+	f.task(t, issueID, "deferred", testutil.Cols{"fire_at": testutil.Raw("now() + interval '1 minute'")})
 
-	f.finishTask(t, finishedTaskID, protocol.EventTaskCompleted, false)
+	f.finishTask(t, sourceID, protocol.EventTaskCompleted, false)
 
-	if got := f.inboxCount(t, f.ownerID); got != 0 {
-		t.Fatalf("workspace_idle inbox rows = %d, want 0 while another task is active", got)
+	if got := f.reconciliationTasks(t, issueID); got != 0 {
+		t.Fatalf("workflow reconciliation tasks = %d, want 0 with deferred work", got)
+	}
+	if got := f.inboxCount(t); got != 0 {
+		t.Fatalf("attention inbox rows = %d, want 0 with deferred work", got)
 	}
 }
 
-func TestWorkspaceIdleSkipsRetryPendingFailures(t *testing.T) {
+func TestWorkflowReconcileRecognisesCustomInProgressStatus(t *testing.T) {
 	f := newWorkspaceIdleFixture(t)
-	issueID := f.issue(t, "member", f.ownerID, "done")
-	taskID := f.activeTask(t, issueID)
-
-	f.finishTask(t, taskID, protocol.EventTaskFailed, true)
-	if got := f.inboxCount(t, f.ownerID); got != 0 {
-		t.Fatalf("workspace_idle inbox rows = %d, want 0 while a retry is pending", got)
-	}
-
-	f.bus.Publish(events.Event{
-		Type:        protocol.EventTaskFailed,
-		WorkspaceID: f.workspaceID,
-		Payload:     map[string]any{"task_id": taskID, "retry_pending": false},
-	})
-	if got := f.inboxCount(t, f.ownerID); got != 1 {
-		t.Fatalf("workspace_idle inbox rows after terminal failure = %d, want 1", got)
-	}
-}
-
-func TestWorkspaceIdleConcurrentTerminalEventsProduceOneRound(t *testing.T) {
-	f := newWorkspaceIdleFixture(t)
-	issueID := f.issue(t, "member", f.ownerID, "done")
-	taskA := f.activeTask(t, issueID)
-	taskB := f.activeTask(t, issueID)
-	f.fx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = ANY($1::uuid[])`, []string{taskA, taskB})
-
-	var wg sync.WaitGroup
-	for _, taskID := range []string{taskA, taskB} {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			f.bus.Publish(events.Event{
-				Type:        protocol.EventTaskCompleted,
-				WorkspaceID: f.workspaceID,
-				Payload:     map[string]any{"task_id": taskID},
-			})
-		}()
-	}
-	wg.Wait()
-
-	if got := f.inboxCount(t, f.ownerID); got != 1 {
-		t.Fatalf("concurrent terminal events created %d workspace_idle rows, want 1", got)
-	}
-}
-
-func TestWorkspaceIdleCanNotifyAgainAfterANewBusyPeriod(t *testing.T) {
-	f := newWorkspaceIdleFixture(t)
-	issueID := f.issue(t, "member", f.ownerID, "done")
-	firstTaskID := f.activeTask(t, issueID)
-	f.finishTask(t, firstTaskID, protocol.EventTaskCompleted, false)
-
-	secondTaskID := f.activeTask(t, issueID)
-	f.finishTask(t, secondTaskID, protocol.EventTaskCompleted, false)
-
-	if got := f.inboxCount(t, f.ownerID); got != 2 {
-		t.Fatalf("workspace_idle inbox rows across two busy periods = %d, want 2", got)
-	}
-}
-
-func TestWorkspaceIdleRecognisesCustomInProgressStatus(t *testing.T) {
-	f := newWorkspaceIdleFixture(t)
-	creatorID := f.member(t, "member")
 	f.fx.Insert(t, "issue_status", testutil.Cols{
 		"workspace_id": f.workspaceID,
 		"key":          "actively_building",
@@ -255,63 +175,113 @@ func TestWorkspaceIdleRecognisesCustomInProgressStatus(t *testing.T) {
 		"color":        "#f59e0b",
 		"position":     1,
 	})
-	issueID := f.issue(t, "member", creatorID, "actively_building")
-	taskID := f.activeTask(t, issueID)
-
-	f.finishTask(t, taskID, protocol.EventTaskCancelled, false)
-
-	if got := f.inboxCount(t, creatorID); got != 1 {
-		t.Fatalf("custom in_progress creator workspace_idle rows = %d, want 1", got)
-	}
-	if got := f.inboxCount(t, f.ownerID); got != 0 {
-		t.Fatalf("manager fallback ran for a custom in_progress status: got %d rows", got)
-	}
-}
-
-func TestWorkspaceIdleDoesNotStartANotificationCycleForChatOnlyWork(t *testing.T) {
-	f := newWorkspaceIdleFixture(t)
-	taskID := f.fx.Task(t, f.agentID, testutil.Cols{
-		"runtime_id": f.runtimeID,
-		"status":     "running",
-		"started_at": testutil.Raw("now()"),
-	})
-	f.bus.Publish(events.Event{
-		Type:        protocol.EventTaskRunning,
-		WorkspaceID: f.workspaceID,
-		Payload:     map[string]any{"task_id": taskID},
-	})
-	f.fx.Exec(t, `UPDATE agent_task_queue SET status = 'completed', completed_at = now() WHERE id = $1`, taskID)
-	f.bus.Publish(events.Event{
-		Type:        protocol.EventTaskCompleted,
-		WorkspaceID: f.workspaceID,
-		Payload:     map[string]any{"task_id": taskID},
-	})
-
-	if got := f.inboxCount(t, f.ownerID); got != 0 {
-		t.Fatalf("chat-only work created %d workspace_idle rows, want 0", got)
-	}
-}
-
-func TestWorkspaceIdleInboxEventHasNoIssueTarget(t *testing.T) {
-	f := newWorkspaceIdleFixture(t)
-	issueID := f.issue(t, "member", f.ownerID, "done")
-	taskID := f.activeTask(t, issueID)
-	var got events.Event
-	f.bus.Subscribe(protocol.EventInboxNew, func(e events.Event) { got = e })
+	issueID := f.issue(t, "agent", f.agentID, "actively_building")
+	taskID := f.task(t, issueID, "running", nil)
 
 	f.finishTask(t, taskID, protocol.EventTaskCompleted, false)
 
-	item, ok := got.Payload.(map[string]any)["item"].(map[string]any)
-	if !ok {
-		t.Fatalf("inbox event payload = %#v, want item map", got.Payload)
+	if got := f.reconciliationTasks(t, issueID); got != 1 {
+		t.Fatalf("workflow reconciliation tasks = %d, want 1 for custom in_progress", got)
 	}
-	if item["issue_id"] != (*string)(nil) && item["issue_id"] != nil {
-		t.Errorf("workspace idle issue_id = %#v, want nil", item["issue_id"])
+}
+
+func TestWorkflowReconcileDoesNotRunHumanOwnedIssue(t *testing.T) {
+	f := newWorkspaceIdleFixture(t)
+	issueID := f.issue(t, "member", f.ownerID, "in_progress")
+	taskID := f.task(t, issueID, "running", nil)
+
+	f.finishTask(t, taskID, protocol.EventTaskCompleted, false)
+
+	if got := f.reconciliationTasks(t, issueID); got != 0 {
+		t.Fatalf("workflow reconciliation tasks = %d, want 0 for member-owned issue", got)
 	}
-	if item["type"] != workspaceIdleNotificationType {
-		t.Errorf("workspace idle type = %#v", item["type"])
+	if got := f.inboxCount(t); got != 0 {
+		t.Fatalf("attention inbox rows = %d, want 0 for member-owned issue", got)
 	}
-	if got.ActorType != "system" {
-		t.Errorf("workspace idle actor type = %q, want system", got.ActorType)
+}
+
+func TestWorkflowReconcileNotifiesOnlyAfterAutomaticContinuationStalls(t *testing.T) {
+	f := newWorkspaceIdleFixture(t)
+	issueID := f.issue(t, "agent", f.agentID, "in_progress")
+	sourceID := f.task(t, issueID, "running", nil)
+	f.finishTask(t, sourceID, protocol.EventTaskCompleted, false)
+
+	var reconcileID string
+	f.fx.QueryRow(t, `
+		SELECT id FROM agent_task_queue
+		WHERE issue_id = $1 AND trigger_evidence_kind = 'workflow_reconcile'
+	`, issueID).Scan(&reconcileID)
+	f.fx.Exec(t, `UPDATE agent_task_queue SET status = 'running', started_at = now() WHERE id = $1`, reconcileID)
+	f.finishTask(t, reconcileID, protocol.EventTaskCompleted, false)
+
+	if got := f.reconciliationTasks(t, issueID); got != 1 {
+		t.Fatalf("workflow reconciliation tasks = %d, want exactly 1", got)
+	}
+	if got := f.inboxCount(t); got != 1 {
+		t.Fatalf("attention inbox rows = %d, want 1 after reconciliation stalls", got)
+	}
+	var targetIssueID, body string
+	f.fx.QueryRow(t, `
+		SELECT issue_id, body FROM inbox_item
+		WHERE workspace_id = $1 AND recipient_id = $2 AND type = 'workspace_idle'
+	`, f.workspaceID, f.ownerID).Scan(&targetIssueID, &body)
+	if targetIssueID != issueID || body == "" {
+		t.Fatalf("attention target/body = %s/%q, want issue %s with guidance", targetIssueID, body, issueID)
+	}
+
+	// Replaying either terminal event cannot create another continuation or
+	// another attention row.
+	f.bus.Publish(events.Event{Type: protocol.EventTaskCompleted, WorkspaceID: f.workspaceID, TaskID: sourceID})
+	f.bus.Publish(events.Event{Type: protocol.EventTaskCompleted, WorkspaceID: f.workspaceID, TaskID: reconcileID})
+	if got := f.reconciliationTasks(t, issueID); got != 1 {
+		t.Fatalf("workflow reconciliation tasks after replay = %d, want 1", got)
+	}
+	if got := f.inboxCount(t); got != 1 {
+		t.Fatalf("attention rows after replay = %d, want idempotent 1", got)
+	}
+}
+
+func TestWorkflowReconcileSkipsRetryPendingFailure(t *testing.T) {
+	f := newWorkspaceIdleFixture(t)
+	issueID := f.issue(t, "agent", f.agentID, "in_progress")
+	taskID := f.task(t, issueID, "running", nil)
+
+	f.finishTask(t, taskID, protocol.EventTaskFailed, true)
+
+	if got := f.reconciliationTasks(t, issueID); got != 0 {
+		t.Fatalf("workflow reconciliation tasks = %d, want 0 while retry is pending", got)
+	}
+	if got := f.inboxCount(t); got != 0 {
+		t.Fatalf("attention inbox rows = %d, want 0 while retry is pending", got)
+	}
+}
+
+func TestWorkflowReconcileDoesNotRestartDeliberatelyCancelledTask(t *testing.T) {
+	f := newWorkspaceIdleFixture(t)
+	issueID := f.issue(t, "agent", f.agentID, "in_progress")
+	taskID := f.task(t, issueID, "running", nil)
+
+	f.finishTask(t, taskID, protocol.EventTaskCancelled, false)
+
+	if got := f.reconciliationTasks(t, issueID); got != 0 {
+		t.Fatalf("workflow reconciliation tasks = %d, want 0 after deliberate cancellation", got)
+	}
+	if got := f.inboxCount(t); got != 0 {
+		t.Fatalf("attention inbox rows = %d, want 0 after deliberate cancellation", got)
+	}
+}
+
+func TestWorkflowReconcileDoesNothingForSettledIssue(t *testing.T) {
+	f := newWorkspaceIdleFixture(t)
+	issueID := f.issue(t, "agent", f.agentID, "in_review")
+	taskID := f.task(t, issueID, "running", nil)
+
+	f.finishTask(t, taskID, protocol.EventTaskCompleted, false)
+
+	if got := f.reconciliationTasks(t, issueID); got != 0 {
+		t.Fatalf("workflow reconciliation tasks = %d, want 0 for in_review issue", got)
+	}
+	if got := f.inboxCount(t); got != 0 {
+		t.Fatalf("attention inbox rows = %d, want 0 for in_review issue", got)
 	}
 }

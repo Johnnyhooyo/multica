@@ -569,7 +569,6 @@ func main() {
 	registerSubscriberListeners(bus, pool)
 	registerActivityListeners(bus, queries)
 	registerNotificationListeners(bus, queries)
-	registerWorkspaceIdleListeners(bus, pool)
 
 	metricsConfig := obsmetrics.ConfigFromEnv()
 	var metricsServer *http.Server
@@ -669,6 +668,7 @@ func main() {
 	// that cache's version, so an idle runtime could keep returning an empty
 	// claim until the cache TTL expires.
 	taskSvc, autopilotSvc := backgroundServices(h)
+	registerWorkspaceIdleListeners(bus, pool, taskSvc)
 	registerAutopilotListeners(bus, autopilotSvc)
 
 	// Construct a LivenessStore that mirrors the one wired into the HTTP

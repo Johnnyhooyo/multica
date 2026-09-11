@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -790,6 +791,45 @@ func TestNotification_TaskFailed(t *testing.T) {
 	}
 	if creatorItems[0].Severity != "action_required" {
 		t.Fatalf("expected severity 'action_required', got %q", creatorItems[0].Severity)
+	}
+}
+
+func TestNotification_TaskFailedWaitsForRecoveryToExhaust(t *testing.T) {
+	queries := db.New(testPool)
+	bus := newNotificationBus(t, queries)
+
+	issueID := createTestIssue(t, testWorkspaceID, testUserID)
+	t.Cleanup(func() {
+		cleanupInboxForIssue(t, issueID)
+		cleanupTestIssue(t, issueID)
+	})
+	addTestSubscriber(t, issueID, "member", testUserID, "creator")
+	var assignedAgentID string
+	if err := testPool.QueryRow(context.Background(), `SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&assignedAgentID); err != nil {
+		t.Fatalf("load assigned agent: %v", err)
+	}
+	if _, err := testPool.Exec(context.Background(), `UPDATE issue SET status = 'in_progress', assignee_type = 'agent', assignee_id = $2 WHERE id = $1`, issueID, assignedAgentID); err != nil {
+		t.Fatalf("mark issue in_progress: %v", err)
+	}
+
+	publish := func(retryPending bool) {
+		bus.Publish(events.Event{
+			Type:        protocol.EventTaskFailed,
+			WorkspaceID: testWorkspaceID,
+			Payload: map[string]any{
+				"task_id":       uuid.NewString(),
+				"agent_id":      assignedAgentID,
+				"issue_id":      issueID,
+				"status":        "failed",
+				"retry_pending": retryPending,
+			},
+		})
+	}
+
+	publish(true)
+	publish(false)
+	if got := inboxItemsForRecipient(t, queries, testUserID); len(got) != 0 {
+		t.Fatalf("task_failed inbox rows = %d, want 0 before workflow recovery is exhausted", len(got))
 	}
 }
 

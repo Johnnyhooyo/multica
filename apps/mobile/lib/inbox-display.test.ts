@@ -107,6 +107,16 @@ describe("getInboxNavigationTarget", () => {
     });
     expect(
       getInboxNavigationTarget(
+        item({ type: "workspace_idle" }),
+        "acme",
+        "history-1",
+      ),
+    ).toMatchObject({
+      pathname: "/[workspace]/issue/[id]",
+      params: { workspace: "acme", id: "issue-1", h: "history-1" },
+    });
+    expect(
+      getInboxNavigationTarget(
         item({ issue_id: null, type: "autopilot_paused" }),
         "acme",
         "history-1",

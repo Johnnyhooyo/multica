@@ -26,8 +26,8 @@ export type InboxItemType =
   // the issue may actually have been created.
   | "quick_create_unconfirmed"
   | "workspace_idle"
-  // System notifications are intentionally issue-less. Keep them in the
-  // same Inbox model so read/archive/realtime behavior remains consistent.
+  // Workspace-level system notifications are issue-less. workspace_idle is a
+  // legacy wire name now used only for issue-scoped workflow attention.
   | "autopilot_paused"
   | "autopilot_quota_exceeded";
 

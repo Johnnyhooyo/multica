@@ -1731,10 +1731,21 @@ WHERE id = $1
 FOR UPDATE;
 
 -- name: HasActiveTaskForIssue :one
--- Returns true if there is any queued, dispatched, waiting_local_directory,
--- or running task for the issue.
+-- Returns true if there is any planned or executing task for the issue.
+-- Deferred rows are durable future work (retry backoff, runtime recovery, or
+-- channel media binding), so treating them as idle would enqueue duplicate
+-- workflow reconciliation.
 SELECT count(*) > 0 AS has_active FROM agent_task_queue
-WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory');
+WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred');
+
+-- name: GetLatestTerminalTaskForIssue :one
+-- Replayed terminal events must not reopen an older convergence round after a
+-- newer task already finished. completed_at is the lifecycle order; created_at
+-- and id provide a deterministic tie-break for bulk terminal transitions.
+SELECT * FROM agent_task_queue
+WHERE issue_id = $1 AND status IN ('completed', 'failed', 'cancelled')
+ORDER BY completed_at DESC NULLS LAST, created_at DESC, id DESC
+LIMIT 1;
 
 -- name: HasPendingTaskForIssue :one
 -- Returns true if there is a queued or dispatched (but not yet running) task for the issue.

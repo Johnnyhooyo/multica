@@ -6013,9 +6013,10 @@ func (s *TaskService) terminateTasksInTx(ctx context.Context, fail func(*db.Quer
 
 // HandleFailedTasks runs the post-failure side effects for a batch of
 // freshly-failed tasks: optional auto-retry, task:failed event broadcast,
-// agent status reconciliation, and (when an issue has no remaining active
-// task and isn't being retried) resetting the issue back to todo so the
-// daemon can pick it up again.
+// and agent status reconciliation. An in_progress issue is deliberately left
+// in_progress when recovery is exhausted: the workflow reconciliation listener
+// owns the one-shot continuation/attention decision. Writing todo here used to
+// bypass normal issue triggers and merely hid the stalled workflow.
 //
 // All callers that surface a task as failed — sweepers, FailTask,
 // recover-orphans — funnel through here so the same UI-consistency
@@ -6026,8 +6027,6 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 	}
 
 	affectedAgents := make(map[string]pgtype.UUID)
-	processedIssues := make(map[string]bool)
-	retriedIssues := make(map[string]bool)
 	retried := 0
 
 	for _, t := range tasks {
@@ -6037,9 +6036,6 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 		if child, _ := s.MaybeRetryFailedTask(ctx, t); child != nil {
 			retryPending = true
 			retried++
-			if t.IssueID.Valid {
-				retriedIssues[util.UUIDToString(t.IssueID)] = true
-			}
 		}
 		if !retryPending {
 			if _, err := s.recoverDelegatedTaskFailure(ctx, t); err != nil {
@@ -6061,44 +6057,6 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 		if t.IssueID.Valid {
 			if issue, err := s.Queries.GetIssue(ctx, t.IssueID); err == nil {
 				workspaceID = util.UUIDToString(issue.WorkspaceID)
-				// Reset stuck in_progress issues only when no other active
-				// task exists for the issue and no retry was just enqueued.
-				issueKey := util.UUIDToString(t.IssueID)
-				// Only "an agent is actively working" resets. in_review and
-				// blocked are excluded — a human or an external dependency owns
-				// the issue then — and a custom status resolves to the canonical
-				// status it inherits, so a custom review gate is excluded for
-				// the same reason In Review is. (MUL-6243)
-				effectiveStatus := issuestatus.Effective(ctx, s.Queries, issue.WorkspaceID, issue.Status)
-				if effectiveStatus == "in_progress" && !processedIssues[issueKey] && !retriedIssues[issueKey] {
-					processedIssues[issueKey] = true
-					hasActive, checkErr := s.Queries.HasActiveTaskForIssue(ctx, t.IssueID)
-					if checkErr != nil {
-						slog.Warn("handle failed tasks: active check failed",
-							"issue_id", issueKey,
-							"error", checkErr,
-						)
-					} else if !hasActive {
-						updatedIssue, updateErr := s.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
-							ID:          t.IssueID,
-							Status:      "todo",
-							WorkspaceID: issue.WorkspaceID,
-						})
-						if updateErr != nil {
-							slog.Warn("handle failed tasks: reset stuck issue failed",
-								"issue_id", issueKey,
-								"error", updateErr,
-							)
-						} else {
-							// This direct reset bypasses the HTTP UpdateIssue
-							// handler that normally emits issue:updated, so emit
-							// it here too. Without it the board / status-filter
-							// caches keep showing the issue as in_progress until
-							// the next write touches it (#4648 / MUL-3782).
-							s.broadcastIssueUpdated(ctx, updatedIssue, issue.Status)
-						}
-					}
-				}
 			}
 		}
 		if workspaceID == "" {

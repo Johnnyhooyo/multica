@@ -421,14 +421,38 @@ func TestNotifierDoesNotRecordUnreplyableTypes(t *testing.T) {
 	}
 }
 
-func TestNotifierPushesWorkspaceIdleWithoutAReplyLedger(t *testing.T) {
+func TestNotifierPushesIssueScopedWorkflowAttentionWithReplyLedger(t *testing.T) {
 	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
 	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_idle"}}
 	e := inReviewEvent()
 	item := e.Payload.(map[string]any)["item"].(map[string]any)
 	item["type"] = "workspace_idle"
+	item["title"] = "交付方案"
+	item["body"] = "自动续跑后仍没有后续工作，请决定下一步。"
+	item["issue_status"] = "in_progress"
+
+	newTestNotifier(t, q, a).HandleInboxNew(e)
+
+	if a.calls != 1 {
+		t.Fatalf("adapter calls = %d, want 1", a.calls)
+	}
+	for _, want := range []string{"[流程需要处理] 交付方案", "请决定下一步", replyHint} {
+		if !strings.Contains(a.lastTx, want) {
+			t.Errorf("push text %q does not contain %q", a.lastTx, want)
+		}
+	}
+	if len(q.created) != 1 {
+		t.Errorf("ledger rows = %d, want 1 for issue-scoped workflow attention", len(q.created))
+	}
+}
+
+func TestNotifierKeepsLegacyIssueLessWorkspaceIdleUnreplyable(t *testing.T) {
+	q := &fakeQueries{workspace: db.Workspace{Slug: "acme"}}
+	a := &fakeAdapter{result: DeliverResult{State: StateDelivered, MessageID: "om_idle_legacy"}}
+	e := inReviewEvent()
+	item := e.Payload.(map[string]any)["item"].(map[string]any)
+	item["type"] = "workspace_idle"
 	item["title"] = "流程停滞"
-	item["body"] = "当前仍有 2 个 in_progress 任务，但所有智能体均已空闲，请检查是否需要继续派发。"
 	delete(item, "issue_id")
 	delete(item, "issue_status")
 
@@ -437,16 +461,11 @@ func TestNotifierPushesWorkspaceIdleWithoutAReplyLedger(t *testing.T) {
 	if a.calls != 1 {
 		t.Fatalf("adapter calls = %d, want 1", a.calls)
 	}
-	for _, want := range []string{"[工作区状态] 流程停滞", "2 个 in_progress 任务"} {
-		if !strings.Contains(a.lastTx, want) {
-			t.Errorf("push text %q does not contain %q", a.lastTx, want)
-		}
-	}
-	if strings.Contains(a.lastTx, replyHint) || strings.Contains(a.lastTx, reviewReplyHint) || strings.Contains(a.lastTx, blockedReplyHint) {
-		t.Errorf("workspace-level push promised an issue reply: %q", a.lastTx)
+	if strings.Contains(a.lastTx, replyHint) {
+		t.Errorf("issue-less compatibility push promised a reply: %q", a.lastTx)
 	}
 	if len(q.created) != 0 {
-		t.Errorf("ledger rows = %d, want 0 for workspace-level notification", len(q.created))
+		t.Errorf("ledger rows = %d, want 0 for issue-less compatibility notification", len(q.created))
 	}
 }
 

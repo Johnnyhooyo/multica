@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_agent_task_workflow_reconcile_source_uidx;

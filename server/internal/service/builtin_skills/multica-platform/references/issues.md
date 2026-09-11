@@ -217,9 +217,12 @@ writes the literal `done` key.
   `done` it enqueues no new agent work, but it does **not** stop tasks already in
   flight — a run in progress keeps going. To stop a running task, cancel the
   task itself.
-- **Failed issue-triggered tasks** may roll an issue from `in_progress` back to
-  `todo` when no active task / retry remains — that is the main server-owned
-  status write on the agent-run path.
+- **Failed issue-triggered tasks** stay `in_progress` while automatic recovery
+  is evaluated. Transient failures retry first; when no planned work remains,
+  the server starts one `workflow_reconcile` continuation. That continuation
+  must queue durable downstream work, move the issue to `in_review`, or move it
+  to `blocked` with one concrete decision question. If it still exits with no
+  plan, the accountable member receives one issue-scoped attention request.
 
 ## Claim ownership without duplicating a run
 

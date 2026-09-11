@@ -813,8 +813,8 @@ func TestRuntimeReconnectRetryHasBoundedTerminalPath(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, issueID).Scan(&issueStatus); err != nil {
 		t.Fatalf("read issue status: %v", err)
 	}
-	if issueStatus != "todo" {
-		t.Fatalf("issue status = %q, want todo after terminal reconnect timeout", issueStatus)
+	if issueStatus != "in_progress" {
+		t.Fatalf("issue status = %q, want in_progress for workflow reconciliation", issueStatus)
 	}
 
 	var undrained, retryChildren int
@@ -830,13 +830,11 @@ func TestRuntimeReconnectRetryHasBoundedTerminalPath(t *testing.T) {
 	}
 }
 
-// TestSweepResetsInProgressIssueToTodo verifies the core fix: when the sweeper
-// force-fails a stale task whose issue is still in_progress (because the daemon
-// crashed mid-run), the issue is reset back to todo so the daemon can re-queue it.
-//
-// Without this fix the issue stays in_progress permanently — the agent never runs
-// to update the status because it was never dispatched.
-func TestSweepResetsInProgressIssueToTodo(t *testing.T) {
+// TestSweepPreservesInProgressIssueForWorkflowReconciliation verifies that the
+// sweeper leaves business state intact. The terminal task event is what lets
+// the workflow listener enqueue one continuation; a direct todo write would
+// bypass that trigger and park the issue without work.
+func TestSweepPreservesInProgressIssueForWorkflowReconciliation(t *testing.T) {
 	if testPool == nil {
 		t.Skip("no database connection")
 	}
@@ -912,7 +910,8 @@ func TestSweepResetsInProgressIssueToTodo(t *testing.T) {
 		t.Fatalf("expected task %s to be in failed tasks, got %v", taskID, failedTasks)
 	}
 
-	// This is what we're testing: issue must be reset from in_progress → todo.
+	// This is what we're testing: the service does not reinterpret a task
+	// failure as a business-state rollback.
 	broadcastFailedTasks(ctx, queries, nil, bus, failedTasks)
 
 	var issueStatus string
@@ -920,8 +919,8 @@ func TestSweepResetsInProgressIssueToTodo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query issue status: %v", err)
 	}
-	if issueStatus != "todo" {
-		t.Fatalf("expected issue status 'todo' after sweep, got '%s' — issue is stuck", issueStatus)
+	if issueStatus != "in_progress" {
+		t.Fatalf("expected issue status 'in_progress' after sweep, got %q", issueStatus)
 	}
 }
 

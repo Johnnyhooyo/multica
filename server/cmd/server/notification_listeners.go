@@ -11,6 +11,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
@@ -83,9 +84,10 @@ var parentBubbleNotifTypes = map[string]bool{
 // unconditionally: they are either addressed at the human directly, or they are
 // exceptions that stall the work until a human looks.
 var delegatedAlwaysNotifTypes = map[string]bool{
-	"mentioned":     true,
-	"task_failed":   true,
-	"agent_blocked": true,
+	"mentioned":      true,
+	"task_failed":    true,
+	"agent_blocked":  true,
+	"workspace_idle": true,
 }
 
 // delegatedStatusNotify are the statuses whose ARRIVAL is worth an inbox item
@@ -769,8 +771,16 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 				}
 			}
 			statusDetails, _ := json.Marshal(detailsMap)
+			// A Feishu task delegated directly from Mika already returns to that
+			// same member conversation on completion. Exclude only that originator
+			// from the generic push; other subscribers keep their normal signal. If
+			// completion fails, task_failed remains the originator's fallback.
+			var statusExclude map[string]bool
+			if recipient := mikaDelegatedHandoffRecipient(ctx, queries, payload, effectiveStatus); recipient != "" {
+				statusExclude = map[string]bool{recipient: true}
+			}
 			notifySubscribers(ctx, queries, bus, issue.ID, issue.Status, e.WorkspaceID, e,
-				nil, "status_changed", "info",
+				statusExclude, "status_changed", "info",
 				issue.Title, body,
 				statusDetails)
 
@@ -1003,6 +1013,9 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 		if !ok {
 			return
 		}
+		if retryPending, _ := payload["retry_pending"].(bool); retryPending {
+			return
+		}
 		agentID, _ := payload["agent_id"].(string)
 		issueID, _ := payload["issue_id"].(string)
 		if issueID == "" {
@@ -1012,6 +1025,21 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 		issue, err := queries.GetIssue(ctx, parseUUID(issueID))
 		if err != nil {
 			slog.Error("task:failed notification: failed to get issue", "issue_id", issueID, "error", err)
+			return
+		}
+
+		// A successor already exists, or this issue is eligible for the one-shot
+		// workflow reconciliation listener. Neither requires a human yet. The
+		// reconciliation run emits the issue-scoped attention notification only
+		// if it also exits without creating a durable next step.
+		hasPlanned, err := queries.HasActiveTaskForIssue(ctx, issue.ID)
+		if err != nil {
+			slog.Error("task:failed notification: failed to check planned work", "issue_id", issueID, "error", err)
+			return
+		}
+		agentOwned := issue.AssigneeType.Valid && issue.AssigneeID.Valid &&
+			(issue.AssigneeType.String == "agent" || issue.AssigneeType.String == "squad")
+		if hasPlanned || (agentOwned && issuestatus.Effective(ctx, queries, issue.WorkspaceID, issue.Status) == issuestatus.InProgress) {
 			return
 		}
 
@@ -1031,6 +1059,34 @@ func registerNotificationListeners(bus *events.Bus, queries *db.Queries) {
 			issue.Title, "",
 			emptyDetails)
 	})
+}
+
+func mikaDelegatedHandoffRecipient(ctx context.Context, queries *db.Queries, payload map[string]any, effectiveStatus string) string {
+	if effectiveStatus != issuestatus.InReview && effectiveStatus != issuestatus.Blocked {
+		return ""
+	}
+	taskID, _ := payload["source_task_id"].(string)
+	taskUUID, err := util.ParseUUID(taskID)
+	if err != nil {
+		return ""
+	}
+	task, err := queries.GetAgentTask(ctx, taskUUID)
+	if err != nil || !task.DelegatedFromTaskID.Valid {
+		return ""
+	}
+	source, err := queries.GetAgentTask(ctx, task.DelegatedFromTaskID)
+	if err != nil || !source.ChatSessionID.Valid || !source.InitiatorUserID.Valid {
+		return ""
+	}
+	delivery, err := queries.GetChannelTaskDelivery(ctx, source.ID)
+	if err != nil || delivery.ChannelType != "feishu" {
+		return ""
+	}
+	mika, err := queries.GetAgent(ctx, source.AgentID)
+	if err != nil || !mika.SystemKey.Valid || mika.SystemKey.String != service.MikaSystemKey {
+		return ""
+	}
+	return util.UUIDToString(source.InitiatorUserID)
 }
 
 // actionableStatusContext returns the concrete question or delivery authored

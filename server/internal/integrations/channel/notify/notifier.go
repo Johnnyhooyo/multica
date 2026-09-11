@@ -313,7 +313,7 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 	// A push is only offered as replyable when the notification type allows a
 	// reply AND the platform can carry one back. WeCom fails the second half,
 	// so its pushes render without the reply hint and rely on the deep link.
-	replyable := decision.Replyable && adapter.AcceptsReplies()
+	replyable := decision.Replyable && adapter.AcceptsReplies() && pushItemIssueID(item) != ""
 	push := buildPush(item, util.UUIDToString(workspaceID), slug, effective, replyable)
 	text := push.Text()
 	if text == "" {
@@ -331,7 +331,7 @@ func (n *Notifier) HandleInboxNew(e events.Event) {
 		Card:            push.Card,
 		WebURL:          push.Link,
 		DesktopURL:      pushDesktopLink(item, util.UUIDToString(workspaceID)),
-		StartTopic:      replyable && pushItemIssueID(item) != "",
+		StartTopic:      replyable,
 	}
 	res, err := adapter.DeliverDM(ctx, ref, binding, text)
 	if err != nil {
@@ -567,7 +567,7 @@ var pushTypeLabels = map[string]string{
 	"task_failed":              "task 失败",
 	"quick_create_failed":      "快速创建失败",
 	"quick_create_unconfirmed": "快速创建待确认",
-	"workspace_idle":           "工作区状态",
+	"workspace_idle":           "流程需要处理",
 }
 
 func pushTypeLabel(t string) string {

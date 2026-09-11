@@ -98,6 +98,14 @@ SELECT * FROM issue
 WHERE id = $1 AND workspace_id = $2
 FOR UPDATE;
 
+-- name: LockIssueForWorkflowReconcile :one
+-- Serialize the terminal-task check with competing reconciliation attempts and
+-- issue status/assignee writes. The caller re-checks status and planned work
+-- while holding this lock before it creates a continuation task.
+SELECT * FROM issue
+WHERE id = $1
+FOR UPDATE;
+
 -- name: MaterializeIssueChannelMediaMarkdown :one
 -- Detached channel media resolves after /issue creation. When the description
 -- still equals the exact creation-time base, replace its inline placeholders

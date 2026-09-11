@@ -51,9 +51,9 @@ var pushableTypes = map[string]bool{
 	"quick_create_failed":      false,
 	"quick_create_unconfirmed": false,
 
-	// Workspace idle notifications aggregate a whole workflow and therefore
-	// have no single issue where a reply could be injected.
-	"workspace_idle": false,
+	// Kept as the stable wire type for installed clients, but now emitted only
+	// after an issue-scoped automatic reconciliation is exhausted.
+	"workspace_idle": true,
 }
 
 // Decide applies the push whitelist.

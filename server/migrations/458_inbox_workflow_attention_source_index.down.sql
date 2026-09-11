@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_inbox_workflow_attention_source_uidx;

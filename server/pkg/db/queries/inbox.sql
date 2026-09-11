@@ -97,6 +97,18 @@ INSERT INTO inbox_item (
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE(sqlc.narg('id')::uuid, gen_random_uuid()))
 RETURNING *;
 
+-- name: CreateWorkflowAttentionInboxItem :one
+-- Event delivery can replay across replicas. The partial unique index on the
+-- source task makes the human-attention edge durable and ON CONFLICT turns a
+-- replay into a no-op instead of a second inbox row / IM push.
+INSERT INTO inbox_item (
+    workspace_id, recipient_type, recipient_id,
+    type, severity, issue_id, title, body,
+    actor_type, actor_id, details, id
+) VALUES ($1, 'member', $2, 'workspace_idle', 'action_required', $3, $4, $5, 'system', NULL, $6, COALESCE(sqlc.narg('id')::uuid, gen_random_uuid()))
+ON CONFLICT DO NOTHING
+RETURNING *;
+
 -- name: MarkInboxRead :one
 UPDATE inbox_item SET read = true
 WHERE id = $1

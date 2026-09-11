@@ -34,7 +34,7 @@ func TestDecide(t *testing.T) {
 		// did not happen.
 		{"quick_create_failed pushes but is not replyable", "quick_create_failed", "", Decision{Push: true}},
 		{"quick_create_unconfirmed pushes but is not replyable", "quick_create_unconfirmed", "", Decision{Push: true}},
-		{"workspace_idle pushes but is not replyable", "workspace_idle", "", Decision{Push: true}},
+		{"workflow attention pushes and is replyable", "workspace_idle", "", Decision{Push: true, Replyable: true}},
 
 		// Everything else is noise for an IM DM.
 		{"new_comment does not push", "new_comment", "", Decision{}},

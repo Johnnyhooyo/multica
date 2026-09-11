@@ -316,6 +316,60 @@ func (q *Queries) CreateInboxItem(ctx context.Context, arg CreateInboxItemParams
 	return i, err
 }
 
+const createWorkflowAttentionInboxItem = `-- name: CreateWorkflowAttentionInboxItem :one
+INSERT INTO inbox_item (
+    workspace_id, recipient_type, recipient_id,
+    type, severity, issue_id, title, body,
+    actor_type, actor_id, details, id
+) VALUES ($1, 'member', $2, 'workspace_idle', 'action_required', $3, $4, $5, 'system', NULL, $6, COALESCE($7::uuid, gen_random_uuid()))
+ON CONFLICT DO NOTHING
+RETURNING id, workspace_id, recipient_type, recipient_id, type, severity, issue_id, title, body, read, archived, created_at, actor_type, actor_id, details
+`
+
+type CreateWorkflowAttentionInboxItemParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	RecipientID pgtype.UUID `json:"recipient_id"`
+	IssueID     pgtype.UUID `json:"issue_id"`
+	Title       string      `json:"title"`
+	Body        pgtype.Text `json:"body"`
+	Details     []byte      `json:"details"`
+	ID          pgtype.UUID `json:"id"`
+}
+
+// Event delivery can replay across replicas. The partial unique index on the
+// source task makes the human-attention edge durable and ON CONFLICT turns a
+// replay into a no-op instead of a second inbox row / IM push.
+func (q *Queries) CreateWorkflowAttentionInboxItem(ctx context.Context, arg CreateWorkflowAttentionInboxItemParams) (InboxItem, error) {
+	row := q.db.QueryRow(ctx, createWorkflowAttentionInboxItem,
+		arg.WorkspaceID,
+		arg.RecipientID,
+		arg.IssueID,
+		arg.Title,
+		arg.Body,
+		arg.Details,
+		arg.ID,
+	)
+	var i InboxItem
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.RecipientType,
+		&i.RecipientID,
+		&i.Type,
+		&i.Severity,
+		&i.IssueID,
+		&i.Title,
+		&i.Body,
+		&i.Read,
+		&i.Archived,
+		&i.CreatedAt,
+		&i.ActorType,
+		&i.ActorID,
+		&i.Details,
+	)
+	return i, err
+}
+
 const getInboxItem = `-- name: GetInboxItem :one
 SELECT id, workspace_id, recipient_type, recipient_id, type, severity, issue_id, title, body, read, archived, created_at, actor_type, actor_id, details FROM inbox_item
 WHERE id = $1

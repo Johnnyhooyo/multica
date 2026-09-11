@@ -480,6 +480,7 @@ func TestDeliverToSubscriber_DelegatedTier(t *testing.T) {
 		{"delegated always gets direct mentions", "delegated", "mentioned", "in_progress", true},
 		{"delegated always gets failures", "delegated", "task_failed", "in_progress", true},
 		{"delegated always gets agent_blocked", "delegated", "agent_blocked", "in_progress", true},
+		{"delegated gets exhausted workflow attention", "delegated", "workspace_idle", "in_progress", true},
 	}
 
 	for _, tc := range cases {
