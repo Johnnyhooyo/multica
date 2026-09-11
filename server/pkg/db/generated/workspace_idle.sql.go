@@ -76,6 +76,54 @@ func (q *Queries) HasActiveTasksInWorkspace(ctx context.Context, workspaceID pgt
 	return has_active, err
 }
 
+const listIdleWorkspaceWorkflowReconcileSourceTaskIDs = `-- name: ListIdleWorkspaceWorkflowReconcileSourceTaskIDs :many
+SELECT latest.id
+FROM issue i
+JOIN LATERAL (
+    SELECT task.id
+    FROM agent_task_queue task
+    WHERE task.issue_id = i.id
+      AND task.status IN ('completed', 'failed', 'cancelled')
+    ORDER BY task.completed_at DESC NULLS LAST, task.created_at DESC, task.id DESC
+    LIMIT 1
+) latest ON true
+WHERE i.workspace_id = $1
+  AND issue_effective_status(i.workspace_id, i.status) = 'in_progress'
+  AND i.assignee_type IN ('agent', 'squad')
+  AND i.assignee_id IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM agent_task_queue active
+      WHERE active.issue_id = i.id
+        AND active.status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+  )
+ORDER BY i.created_at, i.id
+`
+
+// When the workspace crosses from busy to idle, reconcile every agent-owned
+// in-progress issue that has no durable follow-up work. The latest terminal
+// task is the attribution and idempotency source used by the issue-level
+// reconciliation path.
+func (q *Queries) ListIdleWorkspaceWorkflowReconcileSourceTaskIDs(ctx context.Context, workspaceID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listIdleWorkspaceWorkflowReconcileSourceTaskIDs, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []pgtype.UUID{}
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkflowIdleRecipientUserIDs = `-- name: ListWorkflowIdleRecipientUserIDs :many
 WITH in_progress_issues AS MATERIALIZED (
     SELECT id, creator_type, creator_id

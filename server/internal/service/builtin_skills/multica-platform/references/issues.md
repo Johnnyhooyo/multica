@@ -217,9 +217,10 @@ writes the literal `done` key.
   `done` it enqueues no new agent work, but it does **not** stop tasks already in
   flight — a run in progress keeps going. To stop a running task, cancel the
   task itself.
-- **Failed issue-triggered tasks** stay `in_progress` while automatic recovery
-  is evaluated. Transient failures retry first; when no planned work remains,
-  the server starts one `workflow_reconcile` continuation. That continuation
+- **Issue-triggered tasks** stay `in_progress` while automatic recovery is
+  evaluated. Transient failures retry first. When the workspace becomes idle,
+  the server scans every agent-owned `in_progress` issue without planned work
+  and starts one `workflow_reconcile` continuation for each. That continuation
   must queue durable downstream work, move the issue to `in_review`, or move it
   to `blocked` with one concrete decision question. If it still exits with no
   plan, the accountable member receives one issue-scoped attention request.

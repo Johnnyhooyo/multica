@@ -148,6 +148,30 @@ func TestWorkflowReconcileAutomaticallyContinuesStalledAgentIssue(t *testing.T) 
 	}
 }
 
+func TestWorkspaceIdleReconcilesIssueThatStoppedBeforeTheLastTask(t *testing.T) {
+	f := newWorkspaceIdleFixture(t)
+	stalledIssueID := f.issue(t, "agent", f.agentID, "in_progress")
+	stalledTaskID := f.task(t, stalledIssueID, "running", nil)
+	gateIssueID := f.issue(t, "member", f.ownerID, "in_progress")
+	gateTaskID := f.task(t, gateIssueID, "running", nil)
+
+	f.finishTask(t, stalledTaskID, protocol.EventTaskCompleted, false)
+	if got := f.reconciliationTasks(t, stalledIssueID); got != 0 {
+		t.Fatalf("workflow reconciliation tasks while workspace busy = %d, want 0", got)
+	}
+
+	f.finishTask(t, gateTaskID, protocol.EventTaskCompleted, false)
+	if got := f.reconciliationTasks(t, stalledIssueID); got != 1 {
+		t.Fatalf("workflow reconciliation tasks after workspace became idle = %d, want 1", got)
+	}
+	if got := f.reconciliationTasks(t, gateIssueID); got != 0 {
+		t.Fatalf("member-owned gate issue reconciliation tasks = %d, want 0", got)
+	}
+	if got := f.inboxCount(t); got != 0 {
+		t.Fatalf("attention inbox rows = %d, want 0 while automatic continuation is queued", got)
+	}
+}
+
 func TestWorkflowReconcileTreatsDeferredTaskAsPlannedWork(t *testing.T) {
 	f := newWorkspaceIdleFixture(t)
 	issueID := f.issue(t, "agent", f.agentID, "in_progress")

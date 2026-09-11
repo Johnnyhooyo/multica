@@ -28,37 +28,58 @@ var workspaceTerminalTaskEvents = []string{
 	protocol.EventTaskCancelled,
 }
 
-// registerWorkspaceIdleListeners turns completed, failed, and server-refused
-// issue-task events into a convergence pass. The historical workspace-wide
-// idle notification is gone: an empty workspace is not actionable. A human is
-// interrupted only when the issue has no durable work and one automatic
-// reconciliation pass could not be started or could not move the workflow
-// forward.
+// registerWorkspaceIdleListeners starts a convergence pass when a workspace
+// crosses from busy to idle. Every agent-owned in-progress issue without
+// durable follow-up work gets one automatic continuation. A human is
+// interrupted only when that continuation could not be started or could not
+// move the issue forward.
 func registerWorkspaceIdleListeners(bus *events.Bus, pool *pgxpool.Pool, taskSvc *service.TaskService) {
-	queries := db.New(pool)
 	for _, eventType := range workspaceTerminalTaskEvents {
 		bus.Subscribe(eventType, func(e events.Event) {
 			if e.WorkspaceID == "" || taskRetryPending(e) {
 				return
 			}
-			taskID := taskEventTaskID(e)
-			if !taskID.Valid {
-				return
-			}
-			result, err := taskSvc.ReconcileStalledWorkflow(context.Background(), taskID)
-			if err != nil {
-				slog.Error("workflow reconcile failed",
-					"workspace_id", e.WorkspaceID,
-					"task_id", util.UUIDToString(taskID),
-					"error", err,
-				)
-				return
-			}
-			if result.Outcome != service.WorkflowReconcileAttention {
-				return
-			}
-			notifyWorkflowAttention(context.Background(), queries, bus, e.WorkspaceID, result)
+			reconcileIdleWorkspace(context.Background(), bus, pool, taskSvc, e.WorkspaceID)
 		})
+	}
+}
+
+func reconcileIdleWorkspace(
+	ctx context.Context,
+	bus *events.Bus,
+	pool *pgxpool.Pool,
+	taskSvc *service.TaskService,
+	workspaceID string,
+) {
+	workspaceUUID := parseUUID(workspaceID)
+	queries := db.New(pool)
+	hasActive, err := queries.HasActiveTasksInWorkspace(ctx, workspaceUUID)
+	if err != nil {
+		slog.Error("workspace reconciliation: active task check failed", "workspace_id", workspaceID, "error", err)
+		return
+	}
+	if hasActive {
+		return
+	}
+
+	sourceTaskIDs, err := queries.ListIdleWorkspaceWorkflowReconcileSourceTaskIDs(ctx, workspaceUUID)
+	if err != nil {
+		slog.Error("workspace reconciliation: list stalled issues failed", "workspace_id", workspaceID, "error", err)
+		return
+	}
+	for _, sourceTaskID := range sourceTaskIDs {
+		result, reconcileErr := taskSvc.ReconcileStalledWorkflow(ctx, sourceTaskID)
+		if reconcileErr != nil {
+			slog.Error("workflow reconcile failed",
+				"workspace_id", workspaceID,
+				"task_id", util.UUIDToString(sourceTaskID),
+				"error", reconcileErr,
+			)
+			continue
+		}
+		if result.Outcome == service.WorkflowReconcileAttention {
+			notifyWorkflowAttention(ctx, queries, bus, workspaceID, result)
+		}
 	}
 }
 
@@ -122,19 +143,4 @@ func taskRetryPending(e events.Event) bool {
 	}
 	retryPending, _ := payload["retry_pending"].(bool)
 	return retryPending
-}
-
-func taskEventTaskID(e events.Event) pgtype.UUID {
-	if e.TaskID != "" {
-		if id, err := util.ParseUUID(e.TaskID); err == nil {
-			return id
-		}
-	}
-	payload, ok := e.Payload.(map[string]any)
-	if !ok {
-		return pgtype.UUID{}
-	}
-	taskID, _ := payload["task_id"].(string)
-	id, _ := util.ParseUUID(taskID)
-	return id
 }
