@@ -95,9 +95,9 @@ func (d *dmDeliverer) DeliverTopicReply(ctx context.Context, installationID pgty
 	if err != nil {
 		return notify.DeliverResult{}, err
 	}
-	messageID, err := d.client.SendTextMessage(ctx, SendTextParams{
+	messageID, err := d.client.SendMarkdownCard(ctx, SendMarkdownCardParams{
 		InstallationID: creds,
-		Text:           text,
+		Markdown:       text,
 		ReplyTarget:    ReplyTarget{MessageID: rootMessageID, InThread: true},
 	})
 	if err != nil {

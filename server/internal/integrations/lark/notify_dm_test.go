@@ -21,6 +21,7 @@ type recordingDMClient struct {
 	lastText  string
 	lastCard  string
 	textSends []SendTextParams
+	cardSends []SendMarkdownCardParams
 	messageID string
 	err       error
 	topicErr  error
@@ -33,6 +34,11 @@ func (c *recordingDMClient) SendDirectMessage(_ context.Context, p SendDirectPar
 
 func (c *recordingDMClient) SendTextMessage(_ context.Context, p SendTextParams) (string, error) {
 	c.textSends = append(c.textSends, p)
+	return "om_topic", c.topicErr
+}
+
+func (c *recordingDMClient) SendMarkdownCard(_ context.Context, p SendMarkdownCardParams) (string, error) {
+	c.cardSends = append(c.cardSends, p)
 	return "om_topic", c.topicErr
 }
 
@@ -282,22 +288,26 @@ func TestDeliverDMKeepsDeliveredRootWhenTopicCreationFails(t *testing.T) {
 	}
 }
 
-func TestDeliverTopicReplyTargetsOriginalPushRoot(t *testing.T) {
+func TestDeliverTopicReplySendsCardToOriginalPushRoot(t *testing.T) {
 	c := &recordingDMClient{}
 	d := NewDMDeliverer(c, testDMCreds, slog.Default())
 	capable := d.(notify.TopicReplyDeliverer)
-	res, err := capable.DeliverTopicReply(context.Background(), pgtype.UUID{}, "om_root", "agent answer")
+	content := "## 处理结果\n\n- 已完成修改\n- 已通过测试"
+	res, err := capable.DeliverTopicReply(context.Background(), pgtype.UUID{}, "om_root", content)
 	if err != nil {
 		t.Fatalf("DeliverTopicReply: %v", err)
 	}
 	if res.State != notify.StateDelivered || res.MessageID != "om_topic" {
 		t.Fatalf("result = %+v", res)
 	}
-	if len(c.textSends) != 1 {
-		t.Fatalf("text sends = %d, want 1", len(c.textSends))
+	if len(c.textSends) != 0 {
+		t.Fatalf("text sends = %d, want 0", len(c.textSends))
 	}
-	got := c.textSends[0]
-	if got.ChatID != "" || got.Text != "agent answer" || got.ReplyTarget.MessageID != "om_root" || !got.ReplyTarget.InThread {
+	if len(c.cardSends) != 1 {
+		t.Fatalf("card sends = %d, want 1", len(c.cardSends))
+	}
+	got := c.cardSends[0]
+	if got.ChatID != "" || got.Markdown != content || got.ReplyTarget.MessageID != "om_root" || !got.ReplyTarget.InThread {
 		t.Fatalf("topic reply params = %+v", got)
 	}
 }

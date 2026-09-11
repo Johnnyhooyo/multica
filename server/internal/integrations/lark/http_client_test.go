@@ -789,6 +789,45 @@ func TestHTTPClient_SendMarkdownCard_HappyPath(t *testing.T) {
 	}
 }
 
+func TestHTTPClient_SendMarkdownCard_ReplyInThread(t *testing.T) {
+	fake := newLarkFake(t)
+	fake.stubToken("tok_md_reply", 7200)
+	fake.stubReply(
+		map[string]any{
+			"code": 0,
+			"msg":  "ok",
+			"data": map[string]string{"message_id": "om_md_reply_1"},
+		},
+		func(r *http.Request, id string, body map[string]any) {
+			if id != "om_root" {
+				t.Errorf("reply target id: got %q want om_root", id)
+			}
+			if body["msg_type"] != "interactive" {
+				t.Errorf("msg_type: got %v want interactive", body["msg_type"])
+			}
+			if v, _ := body["reply_in_thread"].(bool); !v {
+				t.Errorf("reply_in_thread: got %v want true", body["reply_in_thread"])
+			}
+			if _, hasRecv := body["receive_id"]; hasRecv {
+				t.Errorf("reply endpoint body must NOT carry receive_id; got %v", body)
+			}
+		},
+	)
+
+	c := newTestClient(fake, time.Now)
+	msgID, err := c.SendMarkdownCard(context.Background(), SendMarkdownCardParams{
+		InstallationID: testCreds(),
+		Markdown:       "## 处理结果\n\n- 已完成修改",
+		ReplyTarget:    ReplyTarget{MessageID: "om_root", InThread: true},
+	})
+	if err != nil {
+		t.Fatalf("send markdown card reply: %v", err)
+	}
+	if msgID != "om_md_reply_1" {
+		t.Errorf("message id: got %q want om_md_reply_1", msgID)
+	}
+}
+
 // TestHTTPClient_SendTextMessage_EncodesSpecialCharacters guards the
 // inner JSON envelope's escaping. Lark's spec is "content MUST be a
 // JSON-encoded string", which means newlines and quotes have to be

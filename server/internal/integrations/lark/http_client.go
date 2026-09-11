@@ -476,7 +476,7 @@ func (c *httpAPIClient) SendDirectMessage(ctx context.Context, p SendDirectParam
 // highlighting), no tables, no heading sizes. Schema-2.0's
 // `markdown` tag is closer to GFM.
 func (c *httpAPIClient) SendMarkdownCard(ctx context.Context, p SendMarkdownCardParams) (string, error) {
-	if p.ChatID == "" {
+	if p.ChatID == "" && !p.ReplyTarget.IsSet() {
 		return "", errors.New("lark http client: missing chat_id")
 	}
 	if p.Markdown == "" {
